@@ -17,36 +17,36 @@ def sqrt_example():
         .param .u32 n
     ) {
         .reg .pred %p1;
-        .reg .u64  %inAddr;
-        .reg .u64  %outAddr;
-        .reg .u32  %offset;
-        .reg .u32  %offsetTmp1;
-        .reg .u32  %offsetTmp2;
-        .reg .u64  %offset64;
-        .reg .u32  %size;
+        .reg .u64  %addr;
+        .reg .u32  %tmp<2>;
+        .reg .u64  %offset;
         .reg .f32  %val;
 
-        ld.param.u64 %inAddr, [inputPtr];
-        ld.param.u64 %outAddr, [outputPtr];
-        ld.param.u32 %size, [n];
-
         // Compute the offset as ctaid.x*ntid.x + tid.x
-        mov.u32 %offsetTmp1, %ctaid.x;
-        mov.u32 %offsetTmp2, %ntid.x;
-        mul.lo.u32 %offset, %offsetTmp1, %offsetTmp2;
-        mov.u32 %offsetTmp1, %tid.x;
-        add.u32 %offset, %offset, %offsetTmp1;
-        cvt.u64.u32 %offset64, %offset;
-        mul.lo.u64 %offset64, %offset64, 4;
+        mov.u32 %tmp0, %ctaid.x;
+        mov.u32 %tmp1, %ntid.x;
+        mul.lo.u32 %tmp0, %tmp0, %tmp1;
+        mov.u32 %tmp1, %tid.x;
+        add.u32 %tmp1, %tmp0, %tmp1;
+        cvt.u64.u32 %offset, %tmp1;
+        mul.lo.u64 %offset, %offset, 4;
 
-        setp.lt.u32 %p1, %offset, %size;
+        // Mask out out-of-bounds accesses.
+        ld.param.u32 %tmp0, [n];
+        setp.lt.u32 %p1, %tmp1, %tmp0;
 
-        add.u64 %inAddr, %inAddr, %offset64;
-        add.u64 %outAddr, %outAddr, %offset64;
+        // Load the value from memory.
+        ld.param.u64 %addr, [inputPtr];
+        add.u64 %addr, %addr, %offset;
+        @%p1 ld.global.f32 %val, [%addr];
 
-        @%p1 ld.global.f32 %val, [%inAddr];
+        // Element-wise operation itself.
         @%p1 sqrt.approx.f32 %val, %val;
-        @%p1 st.global.f32 [%outAddr], %val;
+
+        // Store back the output.
+        ld.param.u64 %addr, [outputPtr];
+        add.u64 %addr, %addr, %offset;
+        @%p1 st.global.f32 [%addr], %val;
     }
     """
     fn = compile_function(code, "sqrtElements")
