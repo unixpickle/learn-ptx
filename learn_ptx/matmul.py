@@ -17,7 +17,8 @@ def square_matrix_simple_block():
     ) {
         .reg .pred %p0;
         .reg .u64  %tmp<2>;
-        .reg .u64  %localOffset;
+        .reg .u32  %halfTmp0;
+        .reg .u32  %localOffset;
         .reg .u64  %offsetX;
         .reg .u64  %offsetY;
         .reg .u64  %stride;
@@ -36,12 +37,13 @@ def square_matrix_simple_block():
         ld.param.u64 %ptrB, [ptrB];
         ld.param.u64 %ptrOut, [ptrOut];
 
-        // Local offset is tid.y*ntid.x + tid.x
-        cvt.u64.u32 %localOffset, %tid.y;
-        cvt.u64.u32 %tmp0, %ntid.x;
-        mul.lo.u64 %localOffset, %localOffset, %tmp0;
-        cvt.u64.u32 %tmp0, %tid.x;
-        add.u64 %localOffset, %localOffset, %tmp0;
+        // Local offset is (tid.y*ntid.x + tid.x) * sizeof(float32)
+        mov.u32 %localOffset, %tid.y;
+        mov.u32 %halfTmp0, %ntid.x;
+        mul.lo.u32 %localOffset, %localOffset, %halfTmp0;
+        mov.u32 %halfTmp0, %tid.x;
+        add.u32 %localOffset, %localOffset, %halfTmp0;
+        mul.lo.u32 %localOffset, %localOffset, 4;
 
         // Compute offsets in the output matrix.
         // offsetX = ctaid.x * ntid.x
@@ -59,10 +61,10 @@ def square_matrix_simple_block():
         mul.lo.u64 %stride, %stride, %tmp0;
 
         // Zero out our local portion of the output.
-        cvta.shared.u64 %tmp0, output;
-        add.u64 %tmp0, %tmp0, %localOffset;
+        mov.u32 %halfTmp0, output;
+        add.u32 %halfTmp0, %halfTmp0, %localOffset;
         mov.f32 %val, 0.0;
-        st.shared.f32 [%tmp0], %val;
+        st.shared.f32 [%halfTmp0], %val;
 
         mov.u32 %i, 0;
     loop_start:
@@ -75,14 +77,17 @@ def square_matrix_simple_block():
         add.u64 %tmp0, %tmp0, %offsetX;
         cvt.u64.u32 %tmp1, %tid.y;
         add.u64 %tmp1, %tmp1, %offsetY;
-        // Compute global offset as y*stride+x
+        // Compute pointer as &ptrA[y*stride+x]
         mul.lo.u64 %tmp1, %tmp1, %stride;
         add.u64 %tmp0, %tmp0, %tmp1;
-        cvta.shared.u64 %tmp1, loadedA;
-        add.u64 %tmp1, %tmp1, %localOffset;
+        mul.lo.u64 %tmp0, %tmp0, 4;
+        add.u64 %tmp0, %tmp0, %ptrA;
+        // Output pointer
+        mov.u32 %halfTmp0, loadedA;
+        add.u32 %halfTmp0, %halfTmp0, %localOffset;
         // Copy to local memory
         ld.global.f32 %val, [%tmp0];
-        st.shared.f32 [%tmp1], %val;
+        st.shared.f32 [%halfTmp0], %val;
 
         // Our block offset in B is (offsetX + tid.x, offsetY + i*ntid.y + tid.y)
         cvt.u64.u32 %tmp0, %i;
@@ -93,14 +98,17 @@ def square_matrix_simple_block():
         add.u64 %tmp0, %tmp0, %offsetY;
         cvt.u64.u32 %tmp1, %tid.x;
         add.u64 %tmp1, %tmp1, %offsetX;
-        // Compute global offset as y*stride+x
+        // Compute global offset as &ptrB[y*stride+x]
         mul.lo.u64 %tmp0, %tmp0, %stride;
-        add.u64 %tmp1, %tmp1, %tmp0;
-        cvta.shared.u64 %tmp1, loadedB;
-        add.u64 %tmp1, %tmp1, %localOffset;
+        add.u64 %tmp0, %tmp0, %tmp1;
+        mul.lo.u64 %tmp0, %tmp0, 4;
+        add.u64 %tmp0, %tmp0, %ptrB;
+        // Output pointer
+        mov.u32 %halfTmp0, loadedB;
+        add.u32 %halfTmp0, %halfTmp0, %localOffset;
         // Copy to local memory
         ld.global.f32 %val, [%tmp0];
-        st.shared.f32 [%tmp1], %val;
+        st.shared.f32 [%halfTmp0], %val;
 
         bar.sync 0;
 
@@ -109,7 +117,7 @@ def square_matrix_simple_block():
         add.u32 %i, %i, 1;
         setp.lt.u32 %p0, %i, %numBlocks;
         @%p0 bra loop_start;
-    
+
     loop_end:
         // Write back to output memory.
 
@@ -120,13 +128,14 @@ def square_matrix_simple_block():
         cvt.u64.u32 %tmp1, %tid.y;
         add.u64 %tmp1, %tmp1, %offsetY;
         add.u64 %tmp0, %tmp0, %tmp1;
+        mul.lo.u64 %tmp0, %tmp0, 4;
         add.u64 %tmp0, %tmp0, %ptrOut;
 
         // Input address is given by %localOffset
-        cvta.shared.u64 %tmp1, output;
-        add.u64 %tmp1, %tmp1, %localOffset;
+        mov.u32 %halfTmp0, output;
+        add.u32 %halfTmp0, %halfTmp0, %localOffset;
 
-        ld.global.f32 %val, [%tmp1];
+        ld.shared.f32 %val, [%halfTmp0];
         st.global.f32 [%tmp0], %val;
     }
     """
