@@ -32,7 +32,6 @@ def square_matrix_simple_block():
         .reg .f32  %val<2>;
         .shared .align 4 .f32 loadedA[1024]; // should be ntid.x*ntid.y
         .shared .align 4 .f32 loadedB[1024]; // should be ntid.x*ntid.y
-        .shared .align 4 .f32 output[1024]; // should be ntid.x*ntid.y
 
         ld.param.u32 %numBlocks, [numBlocks];
         ld.param.u64 %ptrA, [ptrA];
@@ -71,13 +70,16 @@ def square_matrix_simple_block():
 
         mov.u32 %i, 0;
     loop_start:
-        // Our block offset in A is (offsetX + i*ntid.x + tid.x, offsetY + tid.y)
+        // Don't write into memory until other threads are
+        // caught up, to avoid races.
+        bar.sync 0;
+
+        // Our block offset in A is (i*ntid.x + tid.x, offsetY + tid.y)
         cvt.u64.u32 %tmp0, %i;
         cvt.u64.u32 %tmp1, %ntid.x;
         mul.lo.u64 %tmp0, %tmp0, %tmp1;
         cvt.u64.u32 %tmp1, %tid.x;
         add.u64 %tmp0, %tmp0, %tmp1;
-        add.u64 %tmp0, %tmp0, %offsetX;
         cvt.u64.u32 %tmp1, %tid.y;
         add.u64 %tmp1, %tmp1, %offsetY;
         // Compute pointer as &ptrA[y*stride+x]
@@ -92,13 +94,12 @@ def square_matrix_simple_block():
         ld.global.f32 %val0, [%tmp0];
         st.shared.f32 [%halfTmp0], %val0;
 
-        // Our block offset in B is (offsetX + tid.x, offsetY + i*ntid.y + tid.y)
+        // Our block offset in B is (offsetX + tid.x, i*ntid.y + tid.y)
         cvt.u64.u32 %tmp0, %i;
         cvt.u64.u32 %tmp1, %ntid.y;
         mul.lo.u64 %tmp0, %tmp0, %tmp1;
         cvt.u64.u32 %tmp1, %tid.y;
         add.u64 %tmp0, %tmp0, %tmp1;
-        add.u64 %tmp0, %tmp0, %offsetY;
         cvt.u64.u32 %tmp1, %tid.x;
         add.u64 %tmp1, %tmp1, %offsetX;
         // Compute global offset as &ptrB[y*stride+x]
@@ -156,12 +157,12 @@ def square_matrix_simple_block():
     loop_end:
         // Write back to output memory.
 
-        // Output address is stride*(offsetX+tid.x) + offsetY+tid.y
-        cvt.u64.u32 %tmp0, %tid.x;
-        add.u64 %tmp0, %tmp0, %offsetX;
+        // Output address is offsetX+tid.x + stride*(offsetY+tid.y)
+        cvt.u64.u32 %tmp0, %tid.y;
+        add.u64 %tmp0, %tmp0, %offsetY;
         mul.lo.u64 %tmp0, %tmp0, %stride;
-        cvt.u64.u32 %tmp1, %tid.y;
-        add.u64 %tmp1, %tmp1, %offsetY;
+        cvt.u64.u32 %tmp1, %tid.x;
+        add.u64 %tmp1, %tmp1, %offsetX;
         add.u64 %tmp0, %tmp0, %tmp1;
         mul.lo.u64 %tmp0, %tmp0, 4;
         add.u64 %tmp0, %tmp0, %ptrOut;
@@ -170,8 +171,9 @@ def square_matrix_simple_block():
     }
     """
     fn = compile_function(code, "blockedMatmul")
-    A = np.random.normal(size=[768, 768]).astype(np.float32)
-    B = np.random.normal(size=[768, 768]).astype(np.float32)
+    size = 768
+    A = np.random.normal(size=[size, size]).astype(np.float32)
+    B = np.random.normal(size=[size, size]).astype(np.float32)
     A_buf = numpy_to_gpu(A)
     B_buf = numpy_to_gpu(B)
     out_buf = numpy_to_gpu(A * 0)
@@ -181,8 +183,8 @@ def square_matrix_simple_block():
         B_buf,
         out_buf,
         np.int32(A.shape[0] // block_size),
-        grid=(block_size, block_size, 1),
-        block=(A.shape[0] // block_size, A.shape[1] // block_size, 1),
+        grid=(A.shape[0] // block_size, A.shape[1] // block_size, 1),
+        block=(block_size, block_size, 1),
     )
     sync()
     results = gpu_to_numpy(out_buf, A.shape, A.dtype)
