@@ -17,17 +17,19 @@ def square_matrix_simple_block():
     ) {
         .reg .pred %p0;
         .reg .u64  %tmp<2>;
-        .reg .u32  %halfTmp0;
+        .reg .u32  %halfTmp<2>;
         .reg .u32  %localOffset;
         .reg .u64  %offsetX;
         .reg .u64  %offsetY;
         .reg .u64  %stride;
         .reg .u32  %i;
+        .reg .u32  %j;
         .reg .u32  %numBlocks;
         .reg .u64  %ptrA;
         .reg .u64  %ptrB;
         .reg .u64  %ptrOut;
-        .reg .f32  %val;
+        .reg .f32  %acc;
+        .reg .f32  %val<2>;
         .shared .align 4 .f32 loadedA[1024]; // should be ntid.x*ntid.y
         .shared .align 4 .f32 loadedB[1024]; // should be ntid.x*ntid.y
         .shared .align 4 .f32 output[1024]; // should be ntid.x*ntid.y
@@ -61,10 +63,11 @@ def square_matrix_simple_block():
         mul.lo.u64 %stride, %stride, %tmp0;
 
         // Zero out our local portion of the output.
-        mov.u32 %halfTmp0, output;
-        add.u32 %halfTmp0, %halfTmp0, %localOffset;
-        mov.f32 %val, 0.0;
-        st.shared.f32 [%halfTmp0], %val;
+        // mov.u32 %halfTmp0, output;
+        // add.u32 %halfTmp0, %halfTmp0, %localOffset;
+        // mov.f32 %val0, 0.0;
+        // st.shared.f32 [%halfTmp0], %val0;
+        mov.f32 %acc, 0.0;
 
         mov.u32 %i, 0;
     loop_start:
@@ -86,8 +89,8 @@ def square_matrix_simple_block():
         mov.u32 %halfTmp0, loadedA;
         add.u32 %halfTmp0, %halfTmp0, %localOffset;
         // Copy to local memory
-        ld.global.f32 %val, [%tmp0];
-        st.shared.f32 [%halfTmp0], %val;
+        ld.global.f32 %val0, [%tmp0];
+        st.shared.f32 [%halfTmp0], %val0;
 
         // Our block offset in B is (offsetX + tid.x, offsetY + i*ntid.y + tid.y)
         cvt.u64.u32 %tmp0, %i;
@@ -107,13 +110,45 @@ def square_matrix_simple_block():
         mov.u32 %halfTmp0, loadedB;
         add.u32 %halfTmp0, %halfTmp0, %localOffset;
         // Copy to local memory
-        ld.global.f32 %val, [%tmp0];
-        st.shared.f32 [%halfTmp0], %val;
+        ld.global.f32 %val0, [%tmp0];
+        st.shared.f32 [%halfTmp0], %val0;
 
         bar.sync 0;
 
-        // TODO: core matrix multiplication inner-loop here.
+        mov.u32 %j, 0;
+    inner_loop_start:
+        // Offset in loadedA is j + tid.y*ntid.x
+        mov.u32 %halfTmp0, %ntid.x;
+        mov.u32 %halfTmp1, %tid.y;
+        mul.lo.u32 %halfTmp1, %halfTmp1, %halfTmp0;
+        add.u32 %halfTmp1, %halfTmp1, %j;
+        mul.lo.u32 %halfTmp1, %halfTmp1, 4;
+        mov.u32 %halfTmp0, loadedA;
+        add.u32 %halfTmp0, %halfTmp0, %halfTmp1;
+        ld.shared.f32 %val0, [%halfTmp0];
 
+        // Offset in loadedB is tid.x + j*ntid.x
+        mov.u32 %halfTmp1, %ntid.x;
+        mul.lo.u32 %halfTmp1, %halfTmp1, %j;
+        mov.u32 %halfTmp0, %tid.x;
+        add.u32 %halfTmp1, %halfTmp1, %halfTmp0;
+        mul.lo.u32 %halfTmp1, %halfTmp1, 4;
+        mov.u32 %halfTmp0, loadedB;
+        add.u32 %halfTmp0, %halfTmp0, %halfTmp1;
+        ld.shared.f32 %val1, [%halfTmp0];
+
+        // Can be optimized to fused operation.
+        mul.f32 %val1, %val0, %val1;
+        add.f32 %acc, %acc, %val1;
+
+        // j += 1; loop while j < ntid.x
+        mov.u32 %halfTmp0, %ntid.x;
+        add.u32 %j, %j, 1;
+        setp.lt.u32 %p0, %j, %halfTmp0;
+        @%p0 bra inner_loop_start;
+
+    inner_loop_end:
+        // i += 1; loop while i < numBlocks
         add.u32 %i, %i, 1;
         setp.lt.u32 %p0, %i, %numBlocks;
         @%p0 bra loop_start;
@@ -131,12 +166,7 @@ def square_matrix_simple_block():
         mul.lo.u64 %tmp0, %tmp0, 4;
         add.u64 %tmp0, %tmp0, %ptrOut;
 
-        // Input address is given by %localOffset
-        mov.u32 %halfTmp0, output;
-        add.u32 %halfTmp0, %halfTmp0, %localOffset;
-
-        ld.shared.f32 %val, [%halfTmp0];
-        st.global.f32 [%tmp0], %val;
+        st.global.f32 [%tmp0], %acc;
     }
     """
     fn = compile_function(code, "blockedMatmul")
