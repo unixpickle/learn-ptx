@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Callable, Sequence, Union
 
@@ -7,6 +8,7 @@ from pycuda.compiler import DynamicModule
 from pycuda.driver import (
     Context,
     DeviceAllocation,
+    Event,
     from_device,
     jit_input_type,
     to_device,
@@ -33,3 +35,20 @@ def gpu_to_numpy(
 
 def sync():
     Context.synchronize()
+
+
+@contextmanager
+def measure_time() -> Callable[[], float]:
+    start = Event()
+    end = Event()
+
+    start.record()
+    start.synchronize()
+
+    def delay_fn() -> float:
+        return start.time_till(end) / 1000
+
+    yield delay_fn
+
+    end.record()
+    end.synchronize()
