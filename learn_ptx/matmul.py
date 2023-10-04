@@ -194,7 +194,7 @@ def square_matrix_simple_block_v2():
 
         // Offset in loadedA / loadedB that we write to.
         .reg .u32  %loadOffset;
-        
+
         // Attributes of the thread/CTA.
         .reg .u32  %blockSize;
         .reg .u32  %tidX;
@@ -247,51 +247,56 @@ def square_matrix_simple_block_v2():
         // We will accumulate into this register.
         mov.f32 %acc, 0.0;
 
+        // We will calculate block offset in A in %ptrA as
+        // (i*ntid.x + tid.x, offsetY + tid.y)
+        // = i*ntid.x + tid.x + stride*(offsetY+tid.y)
+        cvt.u64.u32 %dtmp0, %tidY;
+        add.u64 %dtmp0, %dtmp0, %offsetY;
+        mul.lo.u64 %dtmp0, %dtmp0, %stride;
+        cvt.u64.u32 %dtmp1, %tidX;
+        add.u64 %dtmp0, %dtmp0, %dtmp1;
+        shl.b64 %dtmp0, %dtmp0, 2;
+        add.u64 %ptrA, %ptrA, %dtmp0;
+
+        // We will calculate our block offset in B in %ptrB as
+        // (offsetX + tid.x, i*ntid.y + tid.y)
+        // = offsetX + tid.x + i*stride*blockSize + stride*tid.y
+        cvt.u64.u32 %dtmp0, %tidY;
+        mul.lo.u64 %dtmp0, %dtmp0, %stride;
+        cvt.u64.u32 %dtmp1, %tidX;
+        add.u64 %dtmp0, %dtmp0, %dtmp1;
+        add.u64 %dtmp0, %dtmp0, %offsetX;
+        shl.b64 %dtmp0, %dtmp0, 2;
+        add.u64 %ptrB, %ptrB, %dtmp0;
+
+        // Set %dtmp0 and %dtmp1 to strides in A and B, respectively.
+        // Stride in ptrA is blockSize*4
+        cvt.u64.u32 %dtmp0, %blockSize;
+        shl.b64 %dtmp0, %dtmp0, 2;
+        // Stride in ptrB is stride*blockSize*4
+        mul.lo.u64 %dtmp1, %dtmp0, %stride;
+
         mov.u32 %i, 0;
     loop_start:
         // Don't write into memory until other threads are
         // caught up, to avoid races.
         bar.sync 0;
 
-        // Our block offset in A is (i*ntid.x + tid.x, offsetY + tid.y)
-        cvt.u64.u32 %dtmp0, %i;
-        cvt.u64.u32 %dtmp1, %blockSize;
-        mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
-        cvt.u64.u32 %dtmp1, %tidX;
-        add.u64 %dtmp0, %dtmp0, %dtmp1;
-        cvt.u64.u32 %dtmp1, %tidY;
-        add.u64 %dtmp1, %dtmp1, %offsetY;
-        // Compute pointer as &ptrA[y*stride+x]
-        mul.lo.u64 %dtmp1, %dtmp1, %stride;
-        add.u64 %dtmp0, %dtmp0, %dtmp1;
-        mul.lo.u64 %dtmp0, %dtmp0, 4;
-        add.u64 %dtmp0, %dtmp0, %ptrA;
-        // Output pointer
+        // Read our entry from A into shared memory.
         mov.u32 %stmp0, loadedA;
         add.u32 %stmp0, %stmp0, %loadOffset;
         // Copy to local memory
-        ld.global.f32 %val0, [%dtmp0];
+        ld.global.f32 %val0, [%ptrA];
         st.shared.f32 [%stmp0], %val0;
+        add.u64 %ptrA, %ptrA, %dtmp0;
 
-        // Our block offset in B is (offsetX + tid.x, i*ntid.y + tid.y)
-        cvt.u64.u32 %dtmp0, %i;
-        cvt.u64.u32 %dtmp1, %blockSize;
-        mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
-        cvt.u64.u32 %dtmp1, %tidY;
-        add.u64 %dtmp0, %dtmp0, %dtmp1;
-        cvt.u64.u32 %dtmp1, %tidX;
-        add.u64 %dtmp1, %dtmp1, %offsetX;
-        // Compute global offset as &ptrB[y*stride+x]
-        mul.lo.u64 %dtmp0, %dtmp0, %stride;
-        add.u64 %dtmp0, %dtmp0, %dtmp1;
-        mul.lo.u64 %dtmp0, %dtmp0, 4;
-        add.u64 %dtmp0, %dtmp0, %ptrB;
-        // Output pointer
+        // Read our entry from B into shared memory.
         mov.u32 %stmp0, loadedB;
         add.u32 %stmp0, %stmp0, %loadOffset;
         // Copy to local memory
-        ld.global.f32 %val0, [%dtmp0];
+        ld.global.f32 %val0, [%ptrB];
         st.shared.f32 [%stmp0], %val0;
+        add.u64 %ptrB, %ptrB, %dtmp1;
 
         bar.sync 0;
 
@@ -344,7 +349,7 @@ def square_matrix_simple_block_v2():
         cvt.u64.u32 %dtmp1, %tidX;
         add.u64 %dtmp1, %dtmp1, %offsetX;
         add.u64 %dtmp0, %dtmp0, %dtmp1;
-        mul.lo.u64 %dtmp0, %dtmp0, 4;
+        shl.b64 %dtmp0, %dtmp0, 2;
         add.u64 %dtmp0, %dtmp0, %ptrOut;
 
         st.global.f32 [%dtmp0], %acc;
