@@ -5,13 +5,18 @@ import numpy as np
 from .context import compile_function, gpu_to_numpy, measure_time, numpy_to_gpu, sync
 
 
-def square_matrix_simple_block():
+def matmul_simple_block_v1():
     fn = compile_function("matmul_simple_block_v1.ptx", "blockedMatmul")
     evaluate_matmul_fn(fn)
 
 
-def square_matrix_simple_block_v2():
+def matmul_simple_block_v2():
     fn = compile_function("matmul_simple_block_v2.ptx", "blockedMatmulV2")
+    evaluate_matmul_fn(fn)
+
+
+def matmul_inner_loop():
+    fn = compile_function("matmul_inner_loop.ptx", "blockedMatmulV3")
     evaluate_matmul_fn(fn)
 
 
@@ -44,4 +49,4 @@ def evaluate_matmul_fn(fn: Callable, block_mult: int = 1):
 
 
 if __name__ == "__main__":
-    square_matrix_simple_block_v2()
+    matmul_simple_block_v2()
