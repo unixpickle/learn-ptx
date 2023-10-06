@@ -1,0 +1,164 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry blockedMatmul (
+    .param .u64 ptrA,
+    .param .u64 ptrB,
+    .param .u64 ptrOut,
+    .param .u32 numBlocks
+) {
+    .reg .pred %p0;
+    .reg .u64  %tmp<2>;
+    .reg .u32  %halfTmp<2>;
+    .reg .u32  %localOffset;
+    .reg .u64  %offsetX;
+    .reg .u64  %offsetY;
+    .reg .u64  %stride;
+    .reg .u32  %i;
+    .reg .u32  %j;
+    .reg .u32  %numBlocks;
+    .reg .u64  %ptrA;
+    .reg .u64  %ptrB;
+    .reg .u64  %ptrOut;
+    .reg .f32  %acc;
+    .reg .f32  %val<2>;
+    .shared .align 4 .f32 loadedA[1024]; // should be ntid.x*ntid.y
+    .shared .align 4 .f32 loadedB[1024]; // should be ntid.x*ntid.y
+
+    ld.param.u32 %numBlocks, [numBlocks];
+    ld.param.u64 %ptrA, [ptrA];
+    ld.param.u64 %ptrB, [ptrB];
+    ld.param.u64 %ptrOut, [ptrOut];
+
+    // Local offset is (tid.y*ntid.x + tid.x) * sizeof(float32)
+    mov.u32 %localOffset, %tid.y;
+    mov.u32 %halfTmp0, %ntid.x;
+    mul.lo.u32 %localOffset, %localOffset, %halfTmp0;
+    mov.u32 %halfTmp0, %tid.x;
+    add.u32 %localOffset, %localOffset, %halfTmp0;
+    mul.lo.u32 %localOffset, %localOffset, 4;
+
+    // Compute offsets in the output matrix.
+    // offsetX = ctaid.x * ntid.x
+    cvt.u64.u32 %offsetX, %ctaid.x;
+    cvt.u64.u32 %tmp0, %ntid.x;
+    mul.lo.u64 %offsetX, %offsetX, %tmp0;
+    // offsetY = ctaid.y * ntid.y
+    cvt.u64.u32 %offsetY, %ctaid.y;
+    cvt.u64.u32 %tmp0, %ntid.y;
+    mul.lo.u64 %offsetY, %offsetY, %tmp0;
+
+    // Stride is ntid.x * numBlocks
+    cvt.u64.u32 %stride, %ntid.x;
+    cvt.u64.u32 %tmp0, %numBlocks;
+    mul.lo.u64 %stride, %stride, %tmp0;
+
+    // Zero out our local portion of the output.
+    // mov.u32 %halfTmp0, output;
+    // add.u32 %halfTmp0, %halfTmp0, %localOffset;
+    // mov.f32 %val0, 0.0;
+    // st.shared.f32 [%halfTmp0], %val0;
+    mov.f32 %acc, 0.0;
+
+    mov.u32 %i, 0;
+loop_start:
+    // Don't write into memory until other threads are
+    // caught up, to avoid races.
+    bar.sync 0;
+
+    // Our block offset in A is (i*ntid.x + tid.x, offsetY + tid.y)
+    cvt.u64.u32 %tmp0, %i;
+    cvt.u64.u32 %tmp1, %ntid.x;
+    mul.lo.u64 %tmp0, %tmp0, %tmp1;
+    cvt.u64.u32 %tmp1, %tid.x;
+    add.u64 %tmp0, %tmp0, %tmp1;
+    cvt.u64.u32 %tmp1, %tid.y;
+    add.u64 %tmp1, %tmp1, %offsetY;
+    // Compute pointer as &ptrA[y*stride+x]
+    mul.lo.u64 %tmp1, %tmp1, %stride;
+    add.u64 %tmp0, %tmp0, %tmp1;
+    mul.lo.u64 %tmp0, %tmp0, 4;
+    add.u64 %tmp0, %tmp0, %ptrA;
+    // Output pointer
+    mov.u32 %halfTmp0, loadedA;
+    add.u32 %halfTmp0, %halfTmp0, %localOffset;
+    // Copy to local memory
+    ld.global.f32 %val0, [%tmp0];
+    st.shared.f32 [%halfTmp0], %val0;
+
+    // Our block offset in B is (offsetX + tid.x, i*ntid.y + tid.y)
+    cvt.u64.u32 %tmp0, %i;
+    cvt.u64.u32 %tmp1, %ntid.y;
+    mul.lo.u64 %tmp0, %tmp0, %tmp1;
+    cvt.u64.u32 %tmp1, %tid.y;
+    add.u64 %tmp0, %tmp0, %tmp1;
+    cvt.u64.u32 %tmp1, %tid.x;
+    add.u64 %tmp1, %tmp1, %offsetX;
+    // Compute global offset as &ptrB[y*stride+x]
+    mul.lo.u64 %tmp0, %tmp0, %stride;
+    add.u64 %tmp0, %tmp0, %tmp1;
+    mul.lo.u64 %tmp0, %tmp0, 4;
+    add.u64 %tmp0, %tmp0, %ptrB;
+    // Output pointer
+    mov.u32 %halfTmp0, loadedB;
+    add.u32 %halfTmp0, %halfTmp0, %localOffset;
+    // Copy to local memory
+    ld.global.f32 %val0, [%tmp0];
+    st.shared.f32 [%halfTmp0], %val0;
+
+    bar.sync 0;
+
+    mov.u32 %j, 0;
+inner_loop_start:
+    // Offset in loadedA is j + tid.y*ntid.x
+    mov.u32 %halfTmp0, %ntid.x;
+    mov.u32 %halfTmp1, %tid.y;
+    mul.lo.u32 %halfTmp1, %halfTmp1, %halfTmp0;
+    add.u32 %halfTmp1, %halfTmp1, %j;
+    mul.lo.u32 %halfTmp1, %halfTmp1, 4;
+    mov.u32 %halfTmp0, loadedA;
+    add.u32 %halfTmp0, %halfTmp0, %halfTmp1;
+    ld.shared.f32 %val0, [%halfTmp0];
+
+    // Offset in loadedB is tid.x + j*ntid.x
+    mov.u32 %halfTmp1, %ntid.x;
+    mul.lo.u32 %halfTmp1, %halfTmp1, %j;
+    mov.u32 %halfTmp0, %tid.x;
+    add.u32 %halfTmp1, %halfTmp1, %halfTmp0;
+    mul.lo.u32 %halfTmp1, %halfTmp1, 4;
+    mov.u32 %halfTmp0, loadedB;
+    add.u32 %halfTmp0, %halfTmp0, %halfTmp1;
+    ld.shared.f32 %val1, [%halfTmp0];
+
+    // Can be optimized to fused operation.
+    mul.f32 %val1, %val0, %val1;
+    add.f32 %acc, %acc, %val1;
+
+    // j += 1; loop while j < ntid.x
+    mov.u32 %halfTmp0, %ntid.x;
+    add.u32 %j, %j, 1;
+    setp.lt.u32 %p0, %j, %halfTmp0;
+    @%p0 bra inner_loop_start;
+
+inner_loop_end:
+    // i += 1; loop while i < numBlocks
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %p0, %i, %numBlocks;
+    @%p0 bra loop_start;
+
+loop_end:
+    // Write back to output memory.
+
+    // Output address is offsetX+tid.x + stride*(offsetY+tid.y)
+    cvt.u64.u32 %tmp0, %tid.y;
+    add.u64 %tmp0, %tmp0, %offsetY;
+    mul.lo.u64 %tmp0, %tmp0, %stride;
+    cvt.u64.u32 %tmp1, %tid.x;
+    add.u64 %tmp1, %tmp1, %offsetX;
+    add.u64 %tmp0, %tmp0, %tmp1;
+    mul.lo.u64 %tmp0, %tmp0, 4;
+    add.u64 %tmp0, %tmp0, %ptrOut;
+
+    st.global.f32 [%tmp0], %acc;
+}

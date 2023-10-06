@@ -1,3 +1,4 @@
+import os
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Callable, Sequence, Union
@@ -14,11 +15,14 @@ from pycuda.driver import (
     to_device,
 )
 
+KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+
 
 @lru_cache(maxsize=8)
-def compile_function(code: str, function_name: str) -> Callable:
+def compile_function(code_filename: str, function_name: str) -> Callable:
     module = DynamicModule()
-    module.add_data(bytes(code, "utf-8"), jit_input_type.PTX, name="kernel.ptx")
+    with open(os.path.join(KERNEL_DIR, code_filename), "rb") as f:
+        module.add_data(f.read(), jit_input_type.PTX, name="kernel.ptx")
     module.link()
     return module.get_function(function_name)
 
