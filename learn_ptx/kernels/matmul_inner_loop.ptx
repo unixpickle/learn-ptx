@@ -2,7 +2,7 @@
 .target sm_50 // enough for my Titan X
 .address_size 64
 
-.visible .entry blockedMatmulV3 (
+.visible .entry simpleMatmul (
     .param .u64 ptrA,
     .param .u64 ptrB,
     .param .u64 ptrOut,

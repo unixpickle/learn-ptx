@@ -15,8 +15,13 @@ def matmul_simple_block_v2():
     evaluate_matmul_fn(fn)
 
 
+def matmul_simple_block_v3():
+    fn = compile_function("matmul_simple_block_v3.ptx", "blockedMatmulV3")
+    evaluate_matmul_fn(fn)
+
+
 def matmul_inner_loop():
-    fn = compile_function("matmul_inner_loop.ptx", "blockedMatmulV3")
+    fn = compile_function("matmul_inner_loop.ptx", "simpleMatmul")
     evaluate_matmul_fn(fn)
 
 
@@ -49,4 +54,4 @@ def evaluate_matmul_fn(fn: Callable, block_mult: int = 1):
 
 
 if __name__ == "__main__":
-    matmul_simple_block_v2()
+    matmul_simple_block_v3()
