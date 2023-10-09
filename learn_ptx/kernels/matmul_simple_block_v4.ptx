@@ -1,0 +1,263 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry blockedMatmulV4 (
+    .param .u64 ptrA,
+    .param .u64 ptrB,
+    .param .u64 ptrOut,
+    .param .u32 numBlocks
+) {
+    .reg .pred %p0;
+    .reg .u64  %dtmp<2>;
+    .reg .u32  %stmp<2>;
+
+    // Offset in loadedA / loadedB that we write to.
+    .reg .u32  %loadOffset;
+
+    // Attributes of the thread/CTA.
+    .reg .u32  %tidX;
+    .reg .u32  %tidY;
+
+    .reg .u64  %offsetX;
+    .reg .u64  %offsetY;
+    .reg .u64  %stride;
+    .reg .u32  %i;
+    .reg .u32  %j;
+    .reg .u32  %numBlocks;
+    .reg .u64  %ptrA;
+    .reg .u64  %ptrB;
+    .reg .u64  %ptrOut;
+    .reg .f32  %acc;
+    .reg .f32  %ftmp;
+    .reg .f32  %localA;
+    .reg .f32  %localB<32>;
+    .shared .align 4 .f32 loadedA[1024];
+    .shared .align 4 .f32 loadedB[1024];
+
+    ld.param.u32 %numBlocks, [numBlocks];
+    ld.param.u64 %ptrA, [ptrA];
+    ld.param.u64 %ptrB, [ptrB];
+    ld.param.u64 %ptrOut, [ptrOut];
+
+    mov.u32 %tidX, %tid.x;
+    mov.u32 %tidY, %tid.y;
+
+    // Local offset is (tid.y*blockSize + tid.x) * sizeof(float32)
+    mul.lo.u32 %loadOffset, %tidY, 32;
+    add.u32 %loadOffset, %loadOffset, %tidX;
+    shl.b32 %loadOffset, %loadOffset, 2;
+
+    // Compute offsets in the output matrix.
+    // offsetX = ctaid.x * ntid.x = ctaid.x * blockSize
+    cvt.u64.u32 %offsetX, %ctaid.x;
+    mul.lo.u64 %offsetX, %offsetX, 32;
+    // offsetY = ctaid.y * ntid.y = ctaid.y * blockSize
+    cvt.u64.u32 %offsetY, %ctaid.y;
+    mul.lo.u64 %offsetY, %offsetY, 32;
+
+    // Stride is blockSize * numBlocks;
+    cvt.u64.u32 %stride, %numBlocks;
+    mul.lo.u64 %stride, %stride, 32;
+
+    // We will accumulate into this register.
+    mov.f32 %acc, 0.0;
+
+    // We will calculate block offset in A in %ptrA as
+    // (i*ntid.x + tid.x, offsetY + tid.y)
+    // = i*ntid.x + tid.x + stride*(offsetY+tid.y)
+    cvt.u64.u32 %dtmp0, %tidY;
+    add.u64 %dtmp0, %dtmp0, %offsetY;
+    mul.lo.u64 %dtmp0, %dtmp0, %stride;
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    shl.b64 %dtmp0, %dtmp0, 2;
+    add.u64 %ptrA, %ptrA, %dtmp0;
+
+    // We will calculate our block offset in B in %ptrB as
+    // (offsetX + tid.x, i*ntid.y + tid.y)
+    // = offsetX + tid.x + i*stride*blockSize + stride*tid.y
+    cvt.u64.u32 %dtmp0, %tidY;
+    mul.lo.u64 %dtmp0, %dtmp0, %stride;
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    add.u64 %dtmp0, %dtmp0, %offsetX;
+    shl.b64 %dtmp0, %dtmp0, 2;
+    add.u64 %ptrB, %ptrB, %dtmp0;
+
+    // Stride in ptrB is stride*blockSize*4
+    mul.lo.u64 %dtmp0, %stride, 128;
+
+    mov.u32 %i, 0;
+loop_start:
+    // Don't write into memory until other threads are
+    // caught up, to avoid races.
+    bar.sync 0;
+
+    // Read our entry from A into shared memory.
+    mov.u32 %stmp0, loadedA;
+    add.u32 %stmp0, %stmp0, %loadOffset;
+    // Copy to local memory
+    ld.global.f32 %ftmp, [%ptrA];
+    st.shared.f32 [%stmp0], %ftmp;
+    add.u64 %ptrA, %ptrA, 128;
+
+    // Read our entry from B into shared memory.
+    mov.u32 %stmp0, loadedB;
+    add.u32 %stmp0, %stmp0, %loadOffset;
+    // Copy to local memory
+    ld.global.f32 %ftmp, [%ptrB];
+    st.shared.f32 [%stmp0], %ftmp;
+    add.u64 %ptrB, %ptrB, %dtmp0;
+
+    bar.sync 0;
+
+    // This doesn't seem to help, but it should in theory.
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %p0, %i, %numBlocks;
+    @%p0 prefetch.global.L1 [%ptrA];
+    @%p0 prefetch.global.L1 [%ptrB];
+
+    // We will load each entry into a different thread
+    // in the warp, under the assumption that the block
+    // size is exactly the warp size.
+    // We load &loadedA[tid.x + tid.y*ntid.x] into our register.
+    mul.lo.u32 %stmp0, %tidY, 32;
+    add.u32 %stmp0, %stmp0, %tidX;
+    shl.b32 %stmp0, %stmp0, 2;
+    mov.u32 %stmp1, loadedA;
+    add.u32 %stmp0, %stmp0, %stmp1;
+    ld.shared.f32 %localA, [%stmp0];
+
+    // %stmp0 will be address in B.
+    // It will be &loadedB[tid.x + j*blockSize] starting at j=0
+    mov.u32 %stmp0, loadedB;
+    shl.b32 %stmp1, %tidX, 2;
+    add.u32 %stmp0, %stmp0, %stmp1;
+
+    // Fetch into registers.
+    //
+    //     for i in range(32):
+    //         print(f"ld.shared.f32 %localB{i}, [%stmp0+{i*128}];")
+    //
+    ld.shared.f32 %localB0, [%stmp0+0];
+    ld.shared.f32 %localB1, [%stmp0+128];
+    ld.shared.f32 %localB2, [%stmp0+256];
+    ld.shared.f32 %localB3, [%stmp0+384];
+    ld.shared.f32 %localB4, [%stmp0+512];
+    ld.shared.f32 %localB5, [%stmp0+640];
+    ld.shared.f32 %localB6, [%stmp0+768];
+    ld.shared.f32 %localB7, [%stmp0+896];
+    ld.shared.f32 %localB8, [%stmp0+1024];
+    ld.shared.f32 %localB9, [%stmp0+1152];
+    ld.shared.f32 %localB10, [%stmp0+1280];
+    ld.shared.f32 %localB11, [%stmp0+1408];
+    ld.shared.f32 %localB12, [%stmp0+1536];
+    ld.shared.f32 %localB13, [%stmp0+1664];
+    ld.shared.f32 %localB14, [%stmp0+1792];
+    ld.shared.f32 %localB15, [%stmp0+1920];
+    ld.shared.f32 %localB16, [%stmp0+2048];
+    ld.shared.f32 %localB17, [%stmp0+2176];
+    ld.shared.f32 %localB18, [%stmp0+2304];
+    ld.shared.f32 %localB19, [%stmp0+2432];
+    ld.shared.f32 %localB20, [%stmp0+2560];
+    ld.shared.f32 %localB21, [%stmp0+2688];
+    ld.shared.f32 %localB22, [%stmp0+2816];
+    ld.shared.f32 %localB23, [%stmp0+2944];
+    ld.shared.f32 %localB24, [%stmp0+3072];
+    ld.shared.f32 %localB25, [%stmp0+3200];
+    ld.shared.f32 %localB26, [%stmp0+3328];
+    ld.shared.f32 %localB27, [%stmp0+3456];
+    ld.shared.f32 %localB28, [%stmp0+3584];
+    ld.shared.f32 %localB29, [%stmp0+3712];
+    ld.shared.f32 %localB30, [%stmp0+3840];
+    ld.shared.f32 %localB31, [%stmp0+3968];
+
+    // Perform the local dot product in-register.
+    //
+    //     for i in range(32):
+    //         print(f"shfl.sync.idx.b32 %ftmp, %localA, {i}, 0x1f, 0xffffffff;")
+    //         print(f"fma.rn.f32 %acc, %ftmp, %localB{i}, %acc;")
+    //
+    shfl.sync.idx.b32 %ftmp, %localA, 0, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB0, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 1, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB1, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 2, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB2, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 3, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB3, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 4, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB4, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 5, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB5, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 6, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB6, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 7, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB7, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 8, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB8, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 9, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB9, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 10, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB10, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 11, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB11, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 12, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB12, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 13, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB13, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 14, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB14, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 15, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB15, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 16, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB16, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 17, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB17, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 18, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB18, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 19, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB19, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 20, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB20, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 21, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB21, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 22, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB22, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 23, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB23, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 24, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB24, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 25, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB25, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 26, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB26, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 27, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB27, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 28, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB28, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 29, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB29, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 30, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB30, %acc;
+    shfl.sync.idx.b32 %ftmp, %localA, 31, 0x1f, 0xffffffff;
+    fma.rn.f32 %acc, %ftmp, %localB31, %acc;
+
+    @%p0 bra loop_start;
+
+loop_end:
+    // Write back to output memory.
+
+    // Output address is offsetX+tid.x + stride*(offsetY+tid.y)
+    cvt.u64.u32 %dtmp0, %tidY;
+    add.u64 %dtmp0, %dtmp0, %offsetY;
+    mul.lo.u64 %dtmp0, %dtmp0, %stride;
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %dtmp1, %dtmp1, %offsetX;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    shl.b64 %dtmp0, %dtmp0, 2;
+    add.u64 %dtmp0, %dtmp0, %ptrOut;
+
+    st.global.f32 [%dtmp0], %acc;
+}
