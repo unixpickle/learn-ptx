@@ -52,7 +52,7 @@
 ) {
     .reg .pred %p0;
     .reg .u64 %dtmp<2>;
-    .reg .u32 %stmp<2>;
+    .reg .u32 %stmp<6>;
 
     // Attributes of the thread/CTA.
     .reg .u32 %tidX;
@@ -113,7 +113,7 @@ load_loop_A_start:
     shl.b64 %dtmp0, %dtmp0, 2; // byte offset instead of float offset
     mov.u64 %dtmp1, ptrA;
     add.u64 %dtmp0, %dtmp0, %dtmp1;
-    ld.global.f32 %rowA0, [%dtmp0];
+    ld.global.f32 %colA0, [%dtmp0];
 
     // Offset in loadedA is loadedA[tid.x + tid.y*32 + stmp0*8*32]
     shl.b32 %stmp1, %stmp0, 8; // stmp0*8*32
@@ -123,7 +123,7 @@ load_loop_A_start:
     shl.b32 %stmp1, %stmp1, 2; // byte offset rather than float offset
     mov.u32 %stmp2, loadedA;
     add.u32 %stmp2, %stmp1, %stmp2;
-    st.shared.f32 [%stmp2], %rowA0;
+    st.shared.f32 [%stmp2], %colA0;
 
     add.u32 %stmp0, %stmp0, 1;
     setp.lt.u32 %p0, %stmp0, 4;
@@ -168,7 +168,91 @@ load_loop_B_start:
     @%p0 bra load_loop_B_start
 load_loop_B_end:
 
-    // TODO: loop over eight rows / columns of the inner matrix.
+    // We will loop from j=0 to j=7, loading segments of four
+    // values k=0 to k=3 from A and B.
+    // Load offsets from A as sharedA[tid.y*4*32 + k*32 + 8*(tid.x//8)]
+    // Load offsets from B as sharedB[(tid.x//8 + 4*(tid.x%8) + k) % 32 + j*32*4 + 8*32*(tid.x//8)]
+
+    shr.b32 %stmp0, %tidX, 3; // tid.x//8
+
+    // Store stmp3 = j*32*4 + 8*32*(tid.x//8)      -- updated per inner loop
+    shl.b32 %stmp3, %stmp0, 8; // 8*32*(tid.x//8)
+
+    // Store stmp2 = 4*((tid.x//8 + 4*(tid.x%8) + k)%32) -- reverted after every inner loop.
+    and.b32 %stmp1, %tidX, 7; // tid.x%8
+    shl.b32 %stmp1, %stmp1, 2; // 4*(tid.x%8)
+    add.u32 %stmp2, %stmp0, %stmp1; // tid.x//8 + 4*(tid.x%8)
+    shl.b32 %stmp2, %stmp2, 2; // 4*(tid.x//8 + 4*(tid.x%8))
+    and.u32 %stmp2, %stmp2, 0x7f; // modulo 128
+
+    // Store stmp1 = 4*(j + tid.y*4*32 + 8*(tid.x//8)) -- updated per inner loop
+    shl.b32 %stmp0, %stmp0, 5; // 4*8*(tid.x//8)
+    shl.b32 %stmp1, %tidY, 9; // 4*tid.y*4*32
+    add.u32 %stmp1, %stmp1, %stmp0; // 4*(tid.y*4*32 + 8*(tid.x//8))
+
+    mov.u32 %stmp0, 0;
+block_mul_loop_start:
+    // Loading from A is simple: we load four values from the same column,
+    // which means a stride of 32*4 bytes.
+    mov.u32 %stmp4, sharedA;
+    add.u32 %stmp4, %stmp4, %stmp1;
+    ld.shared.f32 %colA0, [%stmp4];
+    ld.shared.f32 %colA1, [%stmp4+128];
+    ld.shared.f32 %colA2, [%stmp4+256];
+    ld.shared.f32 %colA3, [%stmp4+384];
+
+    // To load from B, we must increment by 4 and modulo 32*4 four times,
+    // once per k, and then revert back by adding 32*4-4*4 = 112 and doing
+    // one more modulus.
+    // We globally offset by stmp3, which is the j-dependent offset which does
+    // not depend on k.
+    mov.u32 %stmp4, sharedB;
+    add.u32 %stmp4, %stmp4, %stmp3;
+    add.u32 %stmp5, %stmp4, %stmp2;
+    ld.shared.f32 %rowB0, [%stmp4];
+    add.u32 %stmp2, %stmp2, 4;
+    and.u32 %stmp2, %stmp2, 0x7f;
+    add.u32 %stmp5, %stmp4, %stmp2;
+    ld.shared.f32 %rowB1, [%stmp4];
+    add.u32 %stmp2, %stmp2, 4;
+    and.u32 %stmp2, %stmp2, 0x7f;
+    add.u32 %stmp5, %stmp4, %stmp2;
+    ld.shared.f32 %rowB2, [%stmp4];
+    add.u32 %stmp2, %stmp2, 4;
+    and.u32 %stmp2, %stmp2, 0x7f;
+    add.u32 %stmp5, %stmp4, %stmp2;
+    ld.shared.f32 %rowB3, [%stmp4];
+    add.u32 %stmp2, %stmp2, 112;
+    and.u32 %stmp2, %stmp2, 0x7f;
+
+    // 4x4 outer product.
+    fma.rn.f32 %outBlock0, %colA0, %rowB0, %outBlock0;
+    fma.rn.f32 %outBlock1, %colA0, %rowB1, %outBlock1;
+    fma.rn.f32 %outBlock2, %colA0, %rowB2, %outBlock2;
+    fma.rn.f32 %outBlock3, %colA0, %rowB3, %outBlock3;
+    fma.rn.f32 %outBlock4, %colA1, %rowB0, %outBlock4;
+    fma.rn.f32 %outBlock5, %colA1, %rowB1, %outBlock5;
+    fma.rn.f32 %outBlock6, %colA1, %rowB2, %outBlock6;
+    fma.rn.f32 %outBlock7, %colA1, %rowB3, %outBlock7;
+    fma.rn.f32 %outBlock8, %colA2, %rowB0, %outBlock8;
+    fma.rn.f32 %outBlock9, %colA2, %rowB1, %outBlock9;
+    fma.rn.f32 %outBlock10, %colA2, %rowB2, %outBlock10;
+    fma.rn.f32 %outBlock11, %colA2, %rowB3, %outBlock11;
+    fma.rn.f32 %outBlock12, %colA3, %rowB0, %outBlock12;
+    fma.rn.f32 %outBlock13, %colA3, %rowB1, %outBlock13;
+    fma.rn.f32 %outBlock14, %colA3, %rowB2, %outBlock14;
+    fma.rn.f32 %outBlock15, %colA3, %rowB3, %outBlock15;
+
+    // Offset in A gets incremented by 4 bytes.
+    add.u32 %stmp1, %stmp1, 4;
+
+    // Offset in B gets incremented by 32*4 bytes.
+    add.u32 %stmp3, %stmp3, 128;
+
+    add.u32 %stmp0, %stmp0, 1;
+    setp.lt.u32 %p0, %stmp0, 8;
+    @%p0 bra block_mul_loop_start;
+block_mul_loop_end:
 
     add.u64 %i, %i, 1;
     setp.lt.u32 %p0, %i, %numBlocks;
