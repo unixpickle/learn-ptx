@@ -1,0 +1,180 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+// Idea: do 4 rows at a time of a 32x32 matrix product, in a way
+// that we only need to accumulate values across each warp at the end.
+// Goal: do 8 loads from shared memory for every 16 FLOPs, rather than
+// doing 2 loads per FLOP as in the simple block examples.
+
+// We load 32x32 chunks from A and B with a slightly unusual layout.
+//
+// Matrix A is laid out like this per tid.y
+//
+//     00000000000000000000000000000000
+//     ...            x3            ...
+//     11111111111111111111111111111111
+//     ...            x3            ...
+//     22222222222222222222222222222222
+//     ...            x3            ...
+//     33333333333333333333333333333333
+//     ...            x3            ...
+//     44444444444444444444444444444444
+//     ...            x3            ...
+//     55555555555555555555555555555555
+//     ...            x3            ...
+//     66666666666666666666666666666666
+//     ...            x3            ...
+//     77777777777777777777777777777777
+//     ...            x3            ...
+//
+// Matrix B is laid out like this per tid.x
+//
+//     00001111222233334444555566667777
+//     ...            x6            ...
+//     00001111222233334444555566667777
+//     F88889999AAAABBBBCCCCDDDDEEEEFFF (shifted by 1)
+//     ...            x6            ...
+//     F88889999AAAABBBBCCCCDDDDEEEEFFF
+//     NNGGGGHHHHIIIIJJJJKKKKLLLLMMMMNN (shifted by 2)
+//     ...            x6            ...
+//     NNGGGGHHHHIIIIJJJJKKKKLLLLMMMMNN
+//     VVVOOOOPPPPQQQQRRRRSSSSTTTTUUUUV (shifted by 3)
+//     ...            x6            ...
+//     VVVOOOOPPPPQQQQRRRRSSSSTTTTUUUUV
+//
+
+.visible .entry bigBlocksMatmul (
+    .param .u64 ptrA,
+    .param .u64 ptrB,
+    .param .u64 ptrOut,
+    .param .u32 numBlocks
+) {
+    .reg .pred %p0;
+    .reg .u64 %dtmp<2>;
+    .reg .u32 %stmp<2>;
+
+    // Attributes of the thread/CTA.
+    .reg .u32 %tidX;
+    .reg .u32 %tidY;
+    .reg .u64 %ctaX;
+    .reg .u64 %ctaY;
+
+    // Arguments
+    .reg .u64 %ptrA;
+    .reg .u64 %ptrB;
+    .reg .u64 %ptrOut;
+    .reg .u32 %numBlocks;
+
+    // Loaded vector from A and B
+    .reg .f32 %rowA<4>;
+    .reg .f32 %rowB<4>;
+    // Accumulated output block which we need to add across four threads in
+    // each warp at the end.
+    .reg .f32 %outBlock<16>;
+
+    // Outer-loop variable.
+    .reg .u64 %i;
+
+    // Cache of current 32x32 block loaded from global memory.
+    .shared .align 4 .f32 loadedA[1024];
+    .shared .align 4 .f32 loadedB[1024];
+
+    ld.param.u64 %ptrA, [ptrA];
+    ld.param.u64 %ptrB, [ptrB];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.u32 %numBlocks, [numBlocks];
+
+    mov.u32 %tidX, %tid.x;
+    mov.u32 %tidY, %tid.y;
+    mov.u64 %ctaX, %ctaid.x;
+    mov.u64 %ctaY, %ctaid.y;
+
+    mov.u64 %i, 0;
+loop_start:
+
+    // Loop over four loads from global memory of A.
+    mov.u32 %stmp0, 0;
+load_loop_A_start:
+    // Load the region of A into shared memory.
+    // Offset is A[i*32 + tid.x + numBlocks*32*(ctaid.y*32 + tid.y + stmp0*8)]
+    shl.b64 %dtmp1, %ctaY, 5; // ctaid.y*32
+    cvt.u64.u32 %dtmp0, %tidY;
+    add.u64 %dtmp0, %dtmp0, %ctaY; // tid.y + ctaid.y*32
+    cvt.u64.u32 %dtmp1, %stmp0;
+    shl.b64 %dtmp1, %dtmp1, 3; // stmp0 * 8
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // ctaid.y*32 + tid.y + stmp0*8
+    mul.lo.u64 %dtmp0, %dtmp0, %numBlocks;
+    shl.b64 %dtmp0, %dtmp0, 5; // 32*numBlocks*(ctaid.y*32+tid.y+stmp0*8)
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    shl.b64 %dtmp1, %i, 5; // i*32
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.x + 1024*numBlocks*(ctaid.y+tid.y+stmp0*8)
+    shl.b64 %dtmp0, %dtmp0, 2; // byte offset instead of float offset
+    mov.u64 %dtmp1, ptrA;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    ld.global.f32 %rowA0, [%dtmp0];
+
+    // Offset in loadedA is loadedA[tid.x + tid.y*32 + stmp0*8*32]
+    shl.b32 %stmp1, %stmp0, 8; // stmp0*8*32
+    shl.b32 %stmp2, %tidY, 5; // tid.y*32
+    add.u32 %stmp1, %stmp1, %stmp2;
+    add.u32 %stmp1, %stmp1, %tidX; // tid.x + tid.y*32 + stmp0*8*32
+    shl.b32 %stmp1, %stmp1, 2; // byte offset rather than float offset
+    mov.u32 %stmp2, loadedA;
+    add.u32 %stmp2, %stmp1, %stmp2;
+    st.shared.f32 [%stmp2], %rowA0;
+
+    add.u32 %stmp0, %stmp0, 1;
+    setp.lt.u32 %p0, %stmp0, 4;
+    @%p0 bra load_loop_A_start
+load_loop_A_end:
+
+    // Loop over loads from global memory of B
+    mov.u32 %stmp0, 0;
+load_loop_B_start:
+    // Load the region of B into shared memory.
+    // Offset is B[32*ctaid.x + tid.x + 32*numBlocks*(i*32+tid.y+stmp0*8)]
+    cvt.u64.u32 %dtmp0, %tidY;
+    shl.b64 %dtmp1, %i, 5; // i*32
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.y
+    cvt.u64.u32 %dtmp1, %stmp0;
+    shl.b64 %dtmp1, 3; // stmp0 * 8
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.y + stmp0*8
+    mul.lo.u64 %dtmp0, %dtmp0, %numBlocks;
+    shl.b64 %dtmp0, %dtmp0, 5; // 32*numBlocks*(i*32+tid.y+stmp0*8)
+    shl.b64 %dtmp1, %ctaX, 5; // ctaid.x*32
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // 32*ctaid.x + tid.x + 32*numBlocks*(i*32+tid.y+stmp0*8)
+    shl.b64 %dtmp0, %dtmp0, 2; // byte offset rather than float offset
+    mov.u64 %dtmp1, ptrA;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    ld.global.f32 %rowB0, [%dtmp0];
+
+    // Offset in loadedB is loadedB[(tid.x+stmp0)%32 + tid.y*32 + stmp0*8*32]
+    add.lo.u32 %stmp2, %tidX, %stmp0;
+    and.b32 %stmp2, %stmp2, 0x1f; // (tid.x+stmp0) % 32
+    shl.b32 %stmp1, %tidY, 5; // tid.y*32
+    add.u32 %stmp1, %stmp1, %stmp2; // (tid.x+stmp0)%32 + tid.y*32
+    shl.b32 %stmp2, %stmp0, 8; // stmp0*8*32
+    add.u32 %stmp1, %stmp1, %stmp2;
+    shl.b32 %stmp1, %stmp1, 2; // byte offset instead of float index
+    mov.u32 %stmp2, loadedB;
+    add.u32 %stmp2, %stmp1, %stmp2;
+    st.shared.f32 [%stmp2], %rowB0;
+
+    add.u32 %stmp0, %stmp0, 1;
+    setp.lt.u32 %p0, %stmp0, 4;
+    @%p0 bra load_loop_B_start
+load_loop_B_end:
+
+    // TODO: loop over eight rows / columns of the inner matrix.
+
+    add.u64 %i, %i, 1;
+    setp.lt.u32 %p0, %i, %numBlocks;
+    @%p0 bra outer_loop;
+loop_end:
+
+    // TODO: accumulate the output entries into shared memory
+    // TODO: write the final entries.
+}
