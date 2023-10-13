@@ -93,6 +93,10 @@
     mov.u64 %i, 0;
 loop_start:
 
+    // Prevent previous iterations of the loop from seeing
+    // new values.
+    bar.sync 0;
+
     // Loop over four loads from global memory of A.
     mov.u32 %stmp0, 0;
 load_loop_A_start:
@@ -167,6 +171,9 @@ load_loop_B_start:
     setp.lt.u32 %p0, %stmp0, 4;
     @%p0 bra load_loop_B_start
 load_loop_B_end:
+
+    // Wait for all copies to be complete.
+    bar.sync 0;
 
     // We will loop from j=0 to j=7, loading segments of four
     // values k=0 to k=3 from A and B.
@@ -259,6 +266,96 @@ block_mul_loop_end:
     @%p0 bra outer_loop;
 loop_end:
 
-    // TODO: accumulate the output entries into shared memory
-    // TODO: write the final entries.
+    // We will reduce into sharedA, so we initially zero it out.
+    shl.b32 %stmp0, %tmpY, 5;
+    add.u32 %stmp0, %stmp0, %tmpX;
+    shl.b32 %stmp0, %stmp0, 2;
+    mov.u32 %stmp1, sharedA;
+    add.u32 %stmp1, %stmp1, %stmp0;
+    st.shared.f32 [%stmp1], 0.0;
+    add.u32 %stmp1, %stmp1, 256; // 32*8
+    st.shared.f32 [%stmp1], 0.0;
+    add.u32 %stmp1, %stmp1, 256; // 32*8
+    st.shared.f32 [%stmp1], 0.0;
+    add.u32 %stmp1, %stmp1, 256; // 32*8
+    st.shared.f32 [%stmp1], 0.0;
+
+    bar.sync 0;
+
+    // Our output block corresponds to the block at row tid.y and tid.x%8.
+    // We need to reduce across all tid.x % 8.
+    // In particular, we will reduce into sharedA[(tid.y*4+i)*32 + tid.x%8 + j]
+    shl.b32 %stmp0, %tidY, 7; // tid.y*4*32
+    and.u32 %stmp1, %tidX, 7; // tid.x%8
+    add.u32 %stmp0, %stmp0, %stmp1; //tid.y*4*32 + tid.x%8
+    shl.b32 %stmp0, %stmp0, 2; // convert to byte offset
+    mov.u32 %stmp1, %sharedA;
+    add.u32 %stmp0, %stmp1, %stmp0;
+
+    // Auto-generated code:
+    //
+    //     for i in range(4):
+    //         for j in range(4):
+    //             print(f"atom.shared.add.f32 [%stmp0+{j*4 + i*32*4}], %outBlock{i*4 + j};")
+    //
+    atom.shared.add.f32 [%stmp0+0], %outBlock0;
+    atom.shared.add.f32 [%stmp0+4], %outBlock1;
+    atom.shared.add.f32 [%stmp0+8], %outBlock2;
+    atom.shared.add.f32 [%stmp0+12], %outBlock3;
+    atom.shared.add.f32 [%stmp0+128], %outBlock4;
+    atom.shared.add.f32 [%stmp0+132], %outBlock5;
+    atom.shared.add.f32 [%stmp0+136], %outBlock6;
+    atom.shared.add.f32 [%stmp0+140], %outBlock7;
+    atom.shared.add.f32 [%stmp0+256], %outBlock8;
+    atom.shared.add.f32 [%stmp0+260], %outBlock9;
+    atom.shared.add.f32 [%stmp0+264], %outBlock10;
+    atom.shared.add.f32 [%stmp0+268], %outBlock11;
+    atom.shared.add.f32 [%stmp0+384], %outBlock12;
+    atom.shared.add.f32 [%stmp0+388], %outBlock13;
+    atom.shared.add.f32 [%stmp0+392], %outBlock14;
+    atom.shared.add.f32 [%stmp0+396], %outBlock15;
+
+    bar.sync 0;
+
+    // We want to dump sharedA into the output.
+    // dtmp0 = stride = numBlocks*32*4
+    shl.b64 %dtmp0, %numBlocks, 7;
+
+    // We start at ((ctaY*32 + tidY)*stride + ctaX*32 + tidX)*4
+    shl.b64 %ctaY, %ctaY, 5;
+    cvt.u64.u32 %dtmp1, %tidY;
+    add.u64 %ctaY, %ctaY, %dtmp1;
+    mul.lo.u64 %ctaY, %ctaY, %dtmp0;
+    shl.b64 %ctaX, %ctaX, 5;
+    add.u64 %ctaY, %ctaY, %ctaX;
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %ctaY, %ctaY, %dtmp1;
+    shl.u64 %ctaY, %ctaY, 2;
+    add.u64 %ptrOut, %ptrOut, %ctaY;
+
+    // The full stride during the copy is stride*8.
+    shl.b64 %dtmp0, %dtmp0, 3;
+
+    shl.u32 %stmp0, %tidY, 5;
+    shl.u32 %stmp1, %tidX, 2;
+    add.u32 %stmp0, %stmp0, %stmp1;
+    mov.u32 %stmp1, sharedA;
+    add.u32 %stmp0, %stmp0, %stmp1;
+
+    ld.shared.f32 %outBlock0, [%stmp0];
+    st.global.f32 [%ptrOut], %outBlock0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
+
+    ld.shared.f32 %outBlock1, [%stmp0+1024]; // 32*8*4
+    st.global.f32 [%ptrOut], %outBlock1;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
+
+    ld.shared.f32 %outBlock2, [%stmp0+2048]; // 2*32*8*4
+    st.global.f32 [%ptrOut], %outBlock2;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
+
+    ld.shared.f32 %outBlock3, [%stmp0+3072]; // 3*32*8*4
+    st.global.f32 [%ptrOut], %outBlock3;
+
+    ret;
 }
