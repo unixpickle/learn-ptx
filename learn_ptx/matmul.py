@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -30,7 +30,46 @@ def matmul_inner_loop():
     evaluate_matmul_fn(fn)
 
 
-def evaluate_matmul_fn(fn: Callable, block_mult: int = 1):
+def matmul_big_blocks():
+    fn = compile_function("matmul_big_blocks.ptx", "bigBlocksMatmul")
+
+    def call_fn(A: np.ndarray, B: np.ndarray, A_buf: Any, B_buf: Any, out_buf: Any):
+        fn(
+            A_buf,
+            B_buf,
+            out_buf,
+            np.int32(A.shape[0] // 32),
+            grid=(
+                A.shape[0] // 32,
+                A.shape[1] // 32,
+                1,
+            ),
+            block=(32, 8, 1),
+        )
+
+    generic_eval_matmul(call_fn)
+
+
+def evaluate_matmul_fn(fn: Callable):
+    def call_fn(A: np.ndarray, B: np.ndarray, A_buf: Any, B_buf: Any, out_buf: Any):
+        block_size = 32
+        fn(
+            A_buf,
+            B_buf,
+            out_buf,
+            np.int32(A.shape[0] // block_size),
+            grid=(
+                A.shape[0] // block_size,
+                A.shape[1] // block_size,
+                1,
+            ),
+            block=(block_size, block_size, 1),
+        )
+
+    generic_eval_matmul(call_fn)
+
+
+def generic_eval_matmul(fn: Callable, block_mult: int = 1):
     size = 8192
     A = np.random.normal(size=[size, size]).astype(np.float32)
     B = np.random.normal(size=[size, size]).astype(np.float32)
@@ -38,18 +77,12 @@ def evaluate_matmul_fn(fn: Callable, block_mult: int = 1):
     B_buf = numpy_to_gpu(B)
     out_buf = numpy_to_gpu(A * 0)
     with measure_time() as timer:
-        block_size = 32
         fn(
+            A,
+            B,
             A_buf,
             B_buf,
             out_buf,
-            np.int32(A.shape[0] // (block_size * block_mult)),
-            grid=(
-                A.shape[0] // (block_size * block_mult),
-                A.shape[1] // (block_size * block_mult),
-                1,
-            ),
-            block=(block_size, block_size, 1),
         )
     sync()
     results = gpu_to_numpy(out_buf, A.shape, A.dtype)
@@ -59,4 +92,4 @@ def evaluate_matmul_fn(fn: Callable, block_mult: int = 1):
 
 
 if __name__ == "__main__":
-    matmul_simple_block_v4()
+    matmul_big_blocks()
