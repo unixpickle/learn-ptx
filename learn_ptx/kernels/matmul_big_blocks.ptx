@@ -196,14 +196,16 @@ load_loop_B_end:
 
     // We will loop from j=0 to j=7, loading segments of four
     // values k=0 to k=3 from A and B.
-    // Load offsets from A as loadedA[tid.y*4*32 + k*32 + 8*(tid.x//8)]
-    // Load offsets from B as loadedB[(tid.x//8 + 4*(tid.x%8) + k) % 32 + j*32*4 + 8*32*(tid.x//8)]
+    // Load offsets from A as loadedA[j + tid.y*4*32 + k*32 + 8*(tid.x//8)]
+    // Load offsets from B as loadedB[(tid.x//8 + 4*(tid.x%8) + k) % 32 + j*32 + 8*32*(tid.x//8)]
 
     shr.b32 %stmp0, %tidX, 3; // tid.x//8
 
-    // Store stmp3 = j*32*4 + 8*32*(tid.x//8)      -- updated per inner loop
-    shl.b32 %stmp3, %stmp0, 8; // 8*32*(tid.x//8)
+    // Outer offset for localB.
+    // Store stmp3 = 4*(j*32 + 8*32*(tid.x//8))      -- updated per inner loop
+    shl.b32 %stmp3, %stmp0, 10; // 4*8*32*(tid.x//8)
 
+    // Inner offset for localB.
     // Store stmp2 = 4*((tid.x//8 + 4*(tid.x%8) + k)%32) -- reverted after every inner loop.
     and.b32 %stmp1, %tidX, 7; // tid.x%8
     shl.b32 %stmp1, %stmp1, 2; // 4*(tid.x%8)
@@ -211,6 +213,7 @@ load_loop_B_end:
     shl.b32 %stmp2, %stmp2, 2; // 4*(tid.x//8 + 4*(tid.x%8))
     and.b32 %stmp2, %stmp2, 0x7f; // modulo 128
 
+    // Outer offset for localA.
     // Store stmp1 = 4*(j + tid.y*4*32 + 8*(tid.x//8)) -- updated per inner loop
     shl.b32 %stmp0, %stmp0, 5; // 4*8*(tid.x//8)
     shl.b32 %stmp1, %tidY, 9; // 4*tid.y*4*32
@@ -228,27 +231,27 @@ block_mul_loop_start:
     ld.shared.f32 %colA3, [%stmp4+384];
 
     // To load from B, we must increment by 4 and modulo 32*4 four times,
-    // once per k, and then revert back by adding 32*4-4*4 = 112 and doing
+    // once per k, and then revert back by adding 32*4-4*3 = 116 and doing
     // one more modulus.
     // We globally offset by stmp3, which is the j-dependent offset which does
     // not depend on k.
     mov.u32 %stmp4, loadedB;
     add.u32 %stmp4, %stmp4, %stmp3;
     add.u32 %stmp5, %stmp4, %stmp2;
-    ld.shared.f32 %rowB0, [%stmp4];
+    ld.shared.f32 %rowB0, [%stmp5];
     add.u32 %stmp2, %stmp2, 4;
     and.b32 %stmp2, %stmp2, 0x7f;
     add.u32 %stmp5, %stmp4, %stmp2;
-    ld.shared.f32 %rowB1, [%stmp4];
+    ld.shared.f32 %rowB1, [%stmp5];
     add.u32 %stmp2, %stmp2, 4;
     and.b32 %stmp2, %stmp2, 0x7f;
     add.u32 %stmp5, %stmp4, %stmp2;
-    ld.shared.f32 %rowB2, [%stmp4];
+    ld.shared.f32 %rowB2, [%stmp5];
     add.u32 %stmp2, %stmp2, 4;
     and.b32 %stmp2, %stmp2, 0x7f;
     add.u32 %stmp5, %stmp4, %stmp2;
-    ld.shared.f32 %rowB3, [%stmp4];
-    add.u32 %stmp2, %stmp2, 112;
+    ld.shared.f32 %rowB3, [%stmp5];
+    add.u32 %stmp2, %stmp2, 116;
     and.b32 %stmp2, %stmp2, 0x7f;
 
     // 4x4 outer product.
@@ -287,27 +290,25 @@ block_mul_loop_end:
 loop_end:
 
     // We will reduce into loadedA, so we initially zero it out.
-    shl.b32 %stmp0, %tidY, 5;
+    shl.b32 %stmp0, %tidY, 5; // tid.y * 32
     add.u32 %stmp0, %stmp0, %tidX;
-    shl.b32 %stmp0, %stmp0, 2;
+    shl.b32 %stmp0, %stmp0, 2; // (tid.y*32 + tid.x) * 4
     mov.u32 %stmp1, loadedA;
     add.u32 %stmp1, %stmp1, %stmp0;
     st.shared.f32 [%stmp1], 0.0;
-    add.u32 %stmp1, %stmp1, 256; // 32*8
-    st.shared.f32 [%stmp1], 0.0;
-    add.u32 %stmp1, %stmp1, 256; // 32*8
-    st.shared.f32 [%stmp1], 0.0;
-    add.u32 %stmp1, %stmp1, 256; // 32*8
-    st.shared.f32 [%stmp1], 0.0;
+    st.shared.f32 [%stmp1+1024], 0.0;
+    st.shared.f32 [%stmp1+2048], 0.0;
+    st.shared.f32 [%stmp1+3072], 0.0;
 
     bar.sync 0;
 
     // Our output block corresponds to the block at row tid.y and tid.x%8.
     // We need to reduce across all tid.x % 8.
-    // In particular, we will reduce into loadedA[(tid.y*4+i)*32 + tid.x%8 + j]
+    // In particular, we will reduce into loadedA[(tid.y*4+i)*32 + 4*(tid.x%8) + j]
     shl.b32 %stmp0, %tidY, 7; // tid.y*4*32
     and.b32 %stmp1, %tidX, 7; // tid.x%8
-    add.u32 %stmp0, %stmp0, %stmp1; //tid.y*4*32 + tid.x%8
+    shl.b32 %stmp1, %stmp1, 2; // 4*(tid.x%8)
+    add.u32 %stmp0, %stmp0, %stmp1; // tid.y*4*32 + 4*(tid.x%8)
     shl.b32 %stmp0, %stmp0, 2; // convert to byte offset
     mov.u32 %stmp1, loadedA;
     add.u32 %stmp0, %stmp1, %stmp0;
@@ -359,7 +360,7 @@ loop_end:
     // The full stride during the copy is stride*8*4.
     shl.b64 %dtmp0, %dtmp0, 5;
 
-    shl.b32 %stmp0, %tidY, 5;
+    shl.b32 %stmp0, %tidY, 7;
     shl.b32 %stmp1, %tidX, 2;
     add.u32 %stmp0, %stmp0, %stmp1;
     mov.u32 %stmp1, loadedA;
