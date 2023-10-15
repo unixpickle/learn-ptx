@@ -50,6 +50,26 @@ def matmul_big_blocks():
     generic_eval_matmul(call_fn)
 
 
+def matmul_big_blocks_v2():
+    fn = compile_function("matmul_big_blocks_v2.ptx", "bigBlocksMatmulV2")
+
+    def call_fn(A: np.ndarray, B: np.ndarray, A_buf: Any, B_buf: Any, out_buf: Any):
+        fn(
+            A_buf,
+            B_buf,
+            out_buf,
+            np.int32(A.shape[0] // 32),
+            grid=(
+                A.shape[0] // 32,
+                A.shape[1] // 32,
+                1,
+            ),
+            block=(32, 8, 1),
+        )
+
+    generic_eval_matmul(call_fn)
+
+
 def evaluate_matmul_fn(fn: Callable):
     def call_fn(A: np.ndarray, B: np.ndarray, A_buf: Any, B_buf: Any, out_buf: Any):
         block_size = 32
@@ -92,4 +112,4 @@ def generic_eval_matmul(fn: Callable, block_mult: int = 1):
 
 
 if __name__ == "__main__":
-    matmul_big_blocks()
+    matmul_big_blocks_v2()
