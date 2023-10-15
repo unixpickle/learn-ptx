@@ -131,7 +131,7 @@ load_loop_A_start:
     cvt.u64.u32 %dtmp1, %tidX;
     add.u64 %dtmp0, %dtmp0, %dtmp1;
     shl.b64 %dtmp1, %i, 5; // i*32
-    add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.x + 1024*numBlocks*(ctaid.y+tid.y+stmp0*8)
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.x + 1024*numBlocks*(ctaid.y*32+tid.y+stmp0*8)
     shl.b64 %dtmp0, %dtmp0, 2; // byte offset instead of float offset
     mov.u64 %dtmp1, %ptrA;
     add.u64 %dtmp0, %dtmp0, %dtmp1;
@@ -167,6 +167,7 @@ load_loop_B_start:
     mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
     shl.b64 %dtmp0, %dtmp0, 5; // 32*numBlocks*(i*32+tid.y+stmp0*8)
     shl.b64 %dtmp1, %ctaX, 5; // ctaid.x*32
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
     cvt.u64.u32 %dtmp1, %tidX;
     add.u64 %dtmp0, %dtmp0, %dtmp1; // 32*ctaid.x + tid.x + 32*numBlocks*(i*32+tid.y+stmp0*8)
     shl.b64 %dtmp0, %dtmp0, 2; // byte offset rather than float offset
@@ -290,6 +291,7 @@ block_mul_loop_end:
 loop_end:
 
     // We will reduce into loadedA, so we initially zero it out.
+    bar.sync 0;
     shl.b32 %stmp0, %tidY, 5; // tid.y * 32
     add.u32 %stmp0, %stmp0, %tidX;
     shl.b32 %stmp0, %stmp0, 2; // (tid.y*32 + tid.x) * 4
