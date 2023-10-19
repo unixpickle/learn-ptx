@@ -388,13 +388,49 @@ block_mul_loop_end:
     @%p0 bra loop_start;
 loop_end:
 
+    // We will write continuous chunks of rows to outPtr.
+    // There are a total of 256 threads and 2048 floats to
+    // write at a time, so we will perform 8 writes per thread
+    // with a stride of 4 rows.
+    //
+    // The first out index is
+    //     outPtr[ctaid.x*64 + tid.x+((tid.y&1)*32) + (ctaid.y*64 + (tid.y//2))*numBlocks*64]
+    //     outPtr + 4*(ctaid.x*64 + tid.x+((tid.y&1)*32) + (ctaid.y*64 + (tid.y//2))*numBlocks*64)
+    //     outPtr + ctaid.x*256 + 4*(tid.x+((tid.y&1) << 5)) + ctaid.y*16384*numBlocks + (tid.y>>1)*numBlocks*256
+    // and stride is
+    //     numBlocks*64*4*4 = numBlocks*1024
+    cvt.u64.u32 %dtmp1, %numBlocks
+    mul.lo.u64 %dtmp0, %dtmp0, %ctaY;
+    shl.b64 %dtmp0, %dtmp0, 14;
+    add.u64 %outPtr, %outPtr, %dtmp0; // A = outPtr + ctaid.y*16384*numBlocks
+    shr.b32 %stmp0, %tidY, 1;
+    shl.b32 %stmp0, %stmp0, 8;
+    cvt.u64.u32 %dtmp0, %stmp0;
+    mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
+    add.u64 %outPtr, %outPtr, %dtmp0; // B = A + (tid.y>>1)*numBlocks*256
+    and.b32 %stmp0, %tidY, 1;
+    shl.b32 %stmp0, %stmp0, 5;
+    add.u32 %stmp0, %stmp0, %tidX;
+    shl.b32 %stmp0, %stmp0, 2;
+    cvt.u64.u32 %dtmp0, %stmp0;
+    add.u64 %outPtr, %outPtr, %dtmp0; // C = A + B + 4*(tid.x+((tid.y&1) << 5))
+    shl.b64 %dtmp0, %ctaX, 8;
+    add.u64 %outPtr, %outPtr, %dtmp0; // D = A + B + C + ctaid.x*256
+    shl.b64 %dtmp0, %dtmp1, 10; // stride is stored in dtmp0
+
+    // Accumulate the output into shared memory and store it.
+    // Our shared memory is half the size of our output block,
+    // so we do two iterations over a loop.
+    mov.u32 %stmp0, 0;
+accumulate_loop:
+
     // We will reduce into loadedB, so we initially zero it out.
     bar.sync 0;
-    shl.b32 %stmp0, %tidY, 5; // tid.y * 32
-    add.u32 %stmp0, %stmp0, %tidX;
-    shl.b32 %stmp0, %stmp0, 2; // (tid.y*32 + tid.x) * 4
-    mov.u32 %stmp1, loadedB;
-    add.u32 %stmp1, %stmp1, %stmp0;
+    shl.b32 %stmp1, %tidY, 5; // tid.y * 32
+    add.u32 %stmp1, %stmp1, %tidX;
+    shl.b32 %stmp1, %stmp1, 2; // (tid.y*32 + tid.x) * 4
+    mov.u32 %stmp2, loadedB;
+    add.u32 %stmp1, %stmp1, %stmp2;
     st.shared.f32 [%stmp1], 0.0;
     st.shared.f32 [%stmp1+1024], 0.0;
     st.shared.f32 [%stmp1+2048], 0.0;
@@ -405,9 +441,140 @@ loop_end:
     st.shared.f32 [%stmp1+7168], 0.0;
     bar.sync 0;
 
-    // TODO: accumulate the output blocks into loadedB.
-    // We will have to do this in two stages, since loadedB
-    // is only half the size of our output.
+    // The top and bottom halves of the output take turns.
+    // This means tid.x % 16 determines our output indices,
+    // and tid.x // 16 determines our mask.
+    and.b32 %stmp1, %tidX, 0xf; // tid.x % 16
+    shr.b32 %stmp2, %tidX, 4; // tid.x // 16
+    setp.eq.u32 %p0, %stmp0, %stmp2;
+
+    // Output start offset is ((tid.x%8)*8 + (stmp1//8)*8*64)*4
+    @%p0 and.b32 %stmp2, %tidX, 0x7;
+    @%p0 shl.b32 %stmp2, %stmp2, 5; // (tid.x % 8) * 8 * 4
+    @%p0 shr.b32 %stmp3, %stmp1, 3;
+    @%p0 shl.b32 %stmp3, %stmp3, 11; // (stmp1//8)*8*64*4
+    @%p0 add.u32 %stmp2, %stmp2, %stmp3; // ((tid.x%8)*8 + (stmp1//8)*8*64)*4
+    @%p0 mov.u32 %stmp3, loadedB;
+    @%p0 add.u32 %stmp2, %stmp2, %stmp3; // &loadedB[(tid.x%8)*8 + (stmp1//8)*8*64]
+
+    // Column stride is 4 bytes
+    // Row stride is 64*4 bytes
+    //
+    //     for i in range(8):
+    //         for j in range(8):
+    //             offset = j * 4 + i * 64 * 4
+    //             idx = j + i * 8
+    //             print(f"@%p0 atom.shared.add.f32 %colA0, [%stmp2+{offset}], %outBlock{idx};")
+    //
+
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+0], %outBlock0;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+4], %outBlock1;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+8], %outBlock2;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+12], %outBlock3;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+16], %outBlock4;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+20], %outBlock5;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+24], %outBlock6;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+28], %outBlock7;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+256], %outBlock8;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+260], %outBlock9;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+264], %outBlock10;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+268], %outBlock11;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+272], %outBlock12;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+276], %outBlock13;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+280], %outBlock14;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+284], %outBlock15;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+512], %outBlock16;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+516], %outBlock17;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+520], %outBlock18;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+524], %outBlock19;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+528], %outBlock20;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+532], %outBlock21;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+536], %outBlock22;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+540], %outBlock23;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+768], %outBlock24;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+772], %outBlock25;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+776], %outBlock26;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+780], %outBlock27;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+784], %outBlock28;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+788], %outBlock29;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+792], %outBlock30;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+796], %outBlock31;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1024], %outBlock32;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1028], %outBlock33;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1032], %outBlock34;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1036], %outBlock35;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1040], %outBlock36;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1044], %outBlock37;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1048], %outBlock38;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1052], %outBlock39;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1280], %outBlock40;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1284], %outBlock41;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1288], %outBlock42;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1292], %outBlock43;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1296], %outBlock44;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1300], %outBlock45;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1304], %outBlock46;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1308], %outBlock47;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1536], %outBlock48;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1540], %outBlock49;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1544], %outBlock50;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1548], %outBlock51;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1552], %outBlock52;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1556], %outBlock53;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1560], %outBlock54;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1564], %outBlock55;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1792], %outBlock56;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1796], %outBlock57;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1800], %outBlock58;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1804], %outBlock59;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1808], %outBlock60;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1812], %outBlock61;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1816], %outBlock62;
+    @%p0 atom.shared.add.f32 %colA0, [%stmp2+1820], %outBlock63;
+
+    // All threads collaborate to copy this shared memory block
+    // into the output pointer.
+    // Our offset to read is 4*(tid.x+((tid.y&1)*32) + (tid.y//2)*64)
+    // Our stride in loadedB is 256*4 bytes = 1024.
+    and.b32 %stmp1, %tidY, 1;
+    shl.b32 %stmp1, %stmp1, 5;
+    add.u32 %stmp1, %stmp1, %tidX;
+    shl.b32 %stmp1, %stmp1, 2; // 4*(tid.x + ((tid.y&1) << 5))
+    shr.b32 %stmp2, %tidY, 1;
+    shl.b32 %stmp2, %stmp2, 8; // (tid.y//2)*64*4
+    add.u32 %stmp1, %stmp1, %stmp2;
+    mov.u32 %stmp2, loadedB;
+    add.u32 %stmp1, %stmp1, %stmp2;
+
+    ld.shared.f32 %colA0, [%stmp1+0];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+    ld.shared.f32 %colA0, [%stmp1+1024];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+    ld.shared.f32 %colA0, [%stmp1+2048];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+    ld.shared.f32 %colA0, [%stmp1+3072];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+    ld.shared.f32 %colA0, [%stmp1+4096];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+    ld.shared.f32 %colA0, [%stmp1+5120];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+    ld.shared.f32 %colA0, [%stmp1+6144];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+    ld.shared.f32 %colA0, [%stmp1+7168];
+    st.global.f32 [%outPtr], %colA0;
+    add.u64 %outPtr, %outPtr, %dtmp0;
+
+    add.u32 %stmp0, %stmp0, 1;
+    setp.lt.u32 %p0, %stmp0, 2;
+    @%p0 bra accumulate_loop;
+accumulate_loop_end:
 
     ret;
 }
