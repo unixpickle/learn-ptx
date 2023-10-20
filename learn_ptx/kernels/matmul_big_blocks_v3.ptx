@@ -138,15 +138,15 @@ loop_start:
     // = A[i*32 + tid.x + numBlocks*64*(ctaid.y*64 + tid.y*8) + j*numBlocks*64]
     shl.b64 %dtmp1, %ctaY, 6; // ctaid.y*64
     cvt.u64.u32 %dtmp0, %tidY;
-    shl.b64 %dtmp0, %dtmp0, 4;
+    shl.b64 %dtmp0, %dtmp0, 3;
     add.u64 %dtmp0, %dtmp0, %dtmp1; // tid.y*8 + ctaid.y*64
     cvt.u64.u32 %dtmp1, %numBlocks;
     mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
-    shl.b64 %dtmp0, %dtmp0, 6; // 64*numBlocks*(ctaid.y*32+tid.y)
+    shl.b64 %dtmp0, %dtmp0, 6; // 64*numBlocks*(ctaid.y*64+tid.y)
     cvt.u64.u32 %dtmp1, %tidX;
     add.u64 %dtmp0, %dtmp0, %dtmp1;
     shl.b64 %dtmp1, %i, 5; // i*32
-    add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.x + 64*numBlocks*(ctaid.y*32+tid.y)
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.x + 64*numBlocks*(ctaid.y*64+tid.y)
     shl.b64 %dtmp0, %dtmp0, 2; // byte offset instead of float offset
     mov.u64 %dtmp1, %ptrA;
     add.u64 %dtmp0, %dtmp0, %dtmp1;
@@ -190,11 +190,11 @@ load_loop_B_start:
     add.u64 %dtmp0, %dtmp0, %dtmp1; // i*32 + tid.y + stmp0*8
     cvt.u64.u32 %dtmp1, %numBlocks;
     mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
-    shl.b64 %dtmp0, %dtmp0, 5; // 32*numBlocks*(i*32+tid.y+stmp0*8)
-    shl.b64 %dtmp1, %ctaX, 5; // ctaid.x*32
+    shl.b64 %dtmp0, %dtmp0, 6; // 64*numBlocks*(i*32+tid.y+stmp0*8)
+    shl.b64 %dtmp1, %ctaX, 6; // ctaid.x*64
     add.u64 %dtmp0, %dtmp0, %dtmp1;
     cvt.u64.u32 %dtmp1, %tidX;
-    add.u64 %dtmp0, %dtmp0, %dtmp1; // 32*ctaid.x + tid.x + 32*numBlocks*(i*32+tid.y+stmp0*8)
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // 64*ctaid.x + tid.x + 32*numBlocks*(i*32+tid.y+stmp0*8)
     shl.b64 %dtmp0, %dtmp0, 2; // byte offset rather than float offset
     mov.u64 %dtmp1, %ptrB;
     add.u64 %dtmp0, %dtmp0, %dtmp1;
@@ -203,10 +203,13 @@ load_loop_B_start:
     add.u64 %dtmp1, %dtmp0, 128;
     ld.global.f32 %rowB1, [%dtmp1];
 
-    // Offset in loadedB is loadedB[(tid.x+stmp0*2+j)%32 + j*32 + tid.y*64 + stmp0*8*64]
+    // Save to loadedB[(tid.x%8+stmp0*2+j)%8 + (tid.x//8)*8 + j*32 + tid.y*64 + stmp0*8*64]
     shl.b32 %stmp1, %tidY, 8; // tid.y*64*4
     shl.b32 %stmp2, %stmp0, 11; // stmp0*8*64*4
     add.u32 %stmp1, %stmp1, %stmp2; // (tid.y*64 + stmp0*8*64)*4
+    shr.b32 %stmp3, %tidX, 3;
+    shl.b32 %stmp3, %stmp3, 5;
+    add.u32 %stmp1, %stmp1, %stmp3; // (tid.y*64 + stmp0*8*64 + (tid.x//8)*8)*4
     mov.u32 %stmp2, loadedB;
     add.u32 %stmp1, %stmp1, %stmp2; // &loadedB[tid.y*64 + stmp0*8*64]
 
@@ -214,9 +217,9 @@ load_loop_B_start:
     shl.b32 %stmp3, %tidX, 2; // tid.x*4
     add.u32 %stmp2, %stmp3, %stmp2; // (tid.x + stmp0*2)*4
     add.u32 %stmp3, %stmp2, 4; // (tid.x + stmp0*2 + 1)*4
-    and.b32 %stmp2, %stmp2, 127; // ((tid.x+stmp0*2) % 32)*4
-    and.b32 %stmp3, %stmp3, 127; // ((tid.x+stmp0*2+1) % 32)*4
-    add.u32 %stmp3, %stmp3, 128; // ((tid.x+stmp0*2+1) % 32 + 32)*4
+    and.b32 %stmp2, %stmp2, 31; // ((tid.x+stmp0*2) % 8)*4
+    and.b32 %stmp3, %stmp3, 31; // ((tid.x+stmp0*2+1) % 8)*4
+    add.u32 %stmp3, %stmp3, 128; // ((tid.x+stmp0*2+1) % 8 + 32)*4
 
     add.u32 %stmp2, %stmp2, %stmp1;
     st.shared.f32 [%stmp2], %rowB0;
@@ -384,38 +387,39 @@ block_mul_loop_end:
 
     add.u64 %i, %i, 1;
     cvt.u64.u32 %dtmp0, %numBlocks;
+    shl.b64 %dtmp0, %dtmp0, 1; // We have 64x64 blocks but loop with stride 32
     setp.lt.u64 %p0, %i, %dtmp0;
     @%p0 bra loop_start;
 loop_end:
 
-    // We will write continuous chunks of rows to outPtr.
+    // We will write continuous chunks of rows to ptrOut.
     // There are a total of 256 threads and 2048 floats to
     // write at a time, so we will perform 8 writes per thread
     // with a stride of 4 rows.
     //
     // The first out index is
-    //     outPtr[ctaid.x*64 + tid.x+((tid.y&1)*32) + (ctaid.y*64 + (tid.y//2))*numBlocks*64]
-    //     outPtr + 4*(ctaid.x*64 + tid.x+((tid.y&1)*32) + (ctaid.y*64 + (tid.y//2))*numBlocks*64)
-    //     outPtr + ctaid.x*256 + 4*(tid.x+((tid.y&1) << 5)) + ctaid.y*16384*numBlocks + (tid.y>>1)*numBlocks*256
+    //     ptrOut[ctaid.x*64 + tid.x+((tid.y&1)*32) + (ctaid.y*64 + (tid.y//2))*numBlocks*64]
+    //     ptrOut + 4*(ctaid.x*64 + tid.x+((tid.y&1)*32) + (ctaid.y*64 + (tid.y//2))*numBlocks*64)
+    //     ptrOut + ctaid.x*256 + 4*(tid.x+((tid.y&1) << 5)) + ctaid.y*16384*numBlocks + (tid.y>>1)*numBlocks*256
     // and stride is
     //     numBlocks*64*4*4 = numBlocks*1024
-    cvt.u64.u32 %dtmp1, %numBlocks
-    mul.lo.u64 %dtmp0, %dtmp0, %ctaY;
+    cvt.u64.u32 %dtmp1, %numBlocks;
+    mul.lo.u64 %dtmp0, %dtmp1, %ctaY;
     shl.b64 %dtmp0, %dtmp0, 14;
-    add.u64 %outPtr, %outPtr, %dtmp0; // A = outPtr + ctaid.y*16384*numBlocks
+    add.u64 %ptrOut, %ptrOut, %dtmp0; // A = ptrOut + ctaid.y*16384*numBlocks
     shr.b32 %stmp0, %tidY, 1;
     shl.b32 %stmp0, %stmp0, 8;
     cvt.u64.u32 %dtmp0, %stmp0;
     mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
-    add.u64 %outPtr, %outPtr, %dtmp0; // B = A + (tid.y>>1)*numBlocks*256
+    add.u64 %ptrOut, %ptrOut, %dtmp0; // B = A + (tid.y>>1)*numBlocks*256
     and.b32 %stmp0, %tidY, 1;
     shl.b32 %stmp0, %stmp0, 5;
     add.u32 %stmp0, %stmp0, %tidX;
     shl.b32 %stmp0, %stmp0, 2;
     cvt.u64.u32 %dtmp0, %stmp0;
-    add.u64 %outPtr, %outPtr, %dtmp0; // C = A + B + 4*(tid.x+((tid.y&1) << 5))
+    add.u64 %ptrOut, %ptrOut, %dtmp0; // C = A + B + 4*(tid.x+((tid.y&1) << 5))
     shl.b64 %dtmp0, %ctaX, 8;
-    add.u64 %outPtr, %outPtr, %dtmp0; // D = A + B + C + ctaid.x*256
+    add.u64 %ptrOut, %ptrOut, %dtmp0; // D = A + B + C + ctaid.x*256
     shl.b64 %dtmp0, %dtmp1, 10; // stride is stored in dtmp0
 
     // Accumulate the output into shared memory and store it.
@@ -442,20 +446,19 @@ accumulate_loop:
     bar.sync 0;
 
     // The top and bottom halves of the output take turns.
-    // This means tid.x % 16 determines our output indices,
-    // and tid.x // 16 determines our mask.
-    and.b32 %stmp1, %tidX, 0xf; // tid.x % 16
-    shr.b32 %stmp2, %tidX, 4; // tid.x // 16
+    // This means tid.y % 4 determines our output indices,
+    // and tid.y // 4 determines our mask.
+    and.b32 %stmp1, %tidY, 3; // tid.y % 4
+    shr.b32 %stmp2, %tidY, 2; // tid.y // 4
     setp.eq.u32 %p0, %stmp0, %stmp2;
 
-    // Output start offset is ((tid.x%8)*8 + (stmp1//8)*8*64)*4
+    // Output start offset is ((tid.x%8)*8 + (stmp1*8*64))*4
     @%p0 and.b32 %stmp2, %tidX, 0x7;
     @%p0 shl.b32 %stmp2, %stmp2, 5; // (tid.x % 8) * 8 * 4
-    @%p0 shr.b32 %stmp3, %stmp1, 3;
-    @%p0 shl.b32 %stmp3, %stmp3, 11; // (stmp1//8)*8*64*4
-    @%p0 add.u32 %stmp2, %stmp2, %stmp3; // ((tid.x%8)*8 + (stmp1//8)*8*64)*4
+    @%p0 shl.b32 %stmp3, %stmp1, 11; // stmp1*8*64*4
+    @%p0 add.u32 %stmp2, %stmp2, %stmp3; // ((tid.x%8)*8 + (stmp1*8*64))*4
     @%p0 mov.u32 %stmp3, loadedB;
-    @%p0 add.u32 %stmp2, %stmp2, %stmp3; // &loadedB[(tid.x%8)*8 + (stmp1//8)*8*64]
+    @%p0 add.u32 %stmp2, %stmp2, %stmp3; // &loadedB[(tid.x%8)*8 + stmp1*8*64]
 
     // Column stride is 4 bytes
     // Row stride is 64*4 bytes
@@ -532,6 +535,8 @@ accumulate_loop:
     @%p0 atom.shared.add.f32 %colA0, [%stmp2+1816], %outBlock62;
     @%p0 atom.shared.add.f32 %colA0, [%stmp2+1820], %outBlock63;
 
+    bar.sync 0;
+
     // All threads collaborate to copy this shared memory block
     // into the output pointer.
     // Our offset to read is 4*(tid.x+((tid.y&1)*32) + (tid.y//2)*64)
@@ -547,32 +552,33 @@ accumulate_loop:
     add.u32 %stmp1, %stmp1, %stmp2;
 
     ld.shared.f32 %colA0, [%stmp1+0];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
     ld.shared.f32 %colA0, [%stmp1+1024];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
     ld.shared.f32 %colA0, [%stmp1+2048];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
     ld.shared.f32 %colA0, [%stmp1+3072];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
     ld.shared.f32 %colA0, [%stmp1+4096];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
     ld.shared.f32 %colA0, [%stmp1+5120];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
     ld.shared.f32 %colA0, [%stmp1+6144];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
     ld.shared.f32 %colA0, [%stmp1+7168];
-    st.global.f32 [%outPtr], %colA0;
-    add.u64 %outPtr, %outPtr, %dtmp0;
+    st.global.f32 [%ptrOut], %colA0;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
 
     add.u32 %stmp0, %stmp0, 1;
     setp.lt.u32 %p0, %stmp0, 2;
+    @%p0 bar.sync 0;
     @%p0 bra accumulate_loop;
 accumulate_loop_end:
 

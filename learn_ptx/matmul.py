@@ -132,4 +132,4 @@ def generic_eval_matmul(fn: Callable, block_mult: int = 1):
 
 
 if __name__ == "__main__":
-    matmul_big_blocks_v2()
+    matmul_big_blocks_v3()
