@@ -1,0 +1,78 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry reductionBoolWarpVec (
+    .param .u64 ptrIn,
+    .param .u64 ptrOut,
+    .param .f32 threshold,
+    .param .u64 numColumns
+) {
+    .reg .pred %p0;
+
+    // Arguments
+    .reg .u64 %ptrIn;
+    .reg .u64 %ptrOut;
+    .reg .f32 %threshold;
+    .reg .u64 %numColumns;
+
+    .reg .u64 %i;
+    .reg .u32 %accumulation;
+    .reg .u32 %commResult;
+    .reg .u64 %tmp0;
+    .reg .v4 .f32 %ftmp;
+
+    // Load arguments.
+    ld.param.u64 %ptrIn, [ptrIn];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.f32 %threshold, [threshold];
+    ld.param.u64 %numColumns, [numColumns];
+
+    cvt.u64.u32 %tmp0, %ctaid.x;
+    add.u64 %ptrOut, %ptrOut, %tmp0;
+    shl.b64 %tmp0, %tmp0, 2;
+    mul.lo.u64 %tmp0, %tmp0, %numColumns;
+    add.u64 %ptrIn, %ptrIn, %tmp0;
+    cvt.u64.u32 %tmp0, %tid.x;
+    shl.b64 %tmp0, %tmp0, 4; // offset by 16*tid.x
+    add.u64 %ptrIn, %ptrIn, %tmp0;
+
+    mov.u64 %i, 0;
+    mov.u32 %accumulation, 0;
+
+loop_start:
+    ldu.global.v4.f32 %ftmp, [%ptrIn];
+    setp.lt.f32 %p0, %ftmp.w, %threshold;
+    @%p0 mov.u32 %accumulation, 1;
+    setp.lt.f32 %p0, %ftmp.x, %threshold;
+    @%p0 mov.u32 %accumulation, 1;
+    setp.lt.f32 %p0, %ftmp.y, %threshold;
+    @%p0 mov.u32 %accumulation, 1;
+    setp.lt.f32 %p0, %ftmp.z, %threshold;
+    @%p0 mov.u32 %accumulation, 1;
+    add.u64 %ptrIn, %ptrIn, 512; // stride of 128 floats = 512 bytes
+    add.u64 %i, %i, 128;
+    setp.lt.u64 %p0, %i, %numColumns;
+    @%p0 bra loop_start;
+loop_end:
+
+    // Synchronize across all ranks using a hypercube.
+    // https://en.wikipedia.org/wiki/Hypercube_(communication_pattern)
+    shfl.sync.bfly.b32 %commResult, %accumulation, 1, 0x1f, 0xffffffff;
+    or.b32 %accumulation, %accumulation, %commResult;
+    shfl.sync.bfly.b32 %commResult, %accumulation, 2, 0x1f, 0xffffffff;
+    or.b32 %accumulation, %accumulation, %commResult;
+    shfl.sync.bfly.b32 %commResult, %accumulation, 4, 0x1f, 0xffffffff;
+    or.b32 %accumulation, %accumulation, %commResult;
+    shfl.sync.bfly.b32 %commResult, %accumulation, 8, 0x1f, 0xffffffff;
+    or.b32 %accumulation, %accumulation, %commResult;
+    shfl.sync.bfly.b32 %commResult, %accumulation, 16, 0x1f, 0xffffffff;
+    or.b32 %accumulation, %accumulation, %commResult;
+
+    // Only rank 0 will store the results.
+    mov.u32 %commResult, %tid.x;
+    setp.eq.u32 %p0, %commResult, 0;
+    @%p0 st.global.u8 [%ptrOut], %accumulation;
+
+    ret;
+}
