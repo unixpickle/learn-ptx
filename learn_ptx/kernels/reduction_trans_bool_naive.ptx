@@ -1,0 +1,51 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry reductionTransBoolNaive (
+    .param .u64 ptrIn,
+    .param .u64 ptrOut,
+    .param .f32 threshold,
+    .param .u64 numRows
+) {
+    .reg .pred %p0;
+
+    // Arguments
+    .reg .u64 %ptrIn;
+    .reg .u64 %ptrOut;
+    .reg .f32 %threshold;
+    .reg .u64 %numRows;
+
+    .reg .u64 %i;
+    .reg .u16 %accumulation;
+    .reg .u64 %tmp0;
+    .reg .f32 %ftmp;
+
+    // Load arguments.
+    ld.param.u64 %ptrIn, [ptrIn];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.f32 %threshold, [threshold];
+    ld.param.u64 %numRows, [numRows];
+
+    cvt.u64.u32 %tmp0, %ctaid.x;
+    add.u64 %ptrOut, %ptrOut, %tmp0;
+    shl.b64 %tmp0, %tmp0, 2;
+    add.u64 %ptrIn, %ptrIn, %tmp0;
+    shl.b64 %tmp0, %numRows, 2; // Stride is numRows*4
+
+    mov.u64 %i, 0;
+    mov.u16 %accumulation, 0;
+
+loop_start:
+    ld.global.f32 %ftmp, [%ptrIn];
+    setp.lt.f32 %p0, %ftmp, %threshold;
+    @%p0 mov.u16 %accumulation, 1;
+    add.u64 %ptrIn, %ptrIn, %tmp0;
+    add.u64 %i, %i, 1;
+    setp.lt.u64 %p0, %i, %numRows;
+    @%p0 bra loop_start;
+loop_end:
+
+    st.global.u8 [%ptrOut], %accumulation;
+    ret;
+}

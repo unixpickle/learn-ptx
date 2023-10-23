@@ -77,5 +77,29 @@ def reduction_bool_warp_vec():
     print(f"true frac {results.astype(np.float32).mean()}")
 
 
+def reduction_trans_bool_naive():
+    fn = compile_function("reduction_trans_bool_naive.ptx", "reductionTransBoolNaive")
+    inputs = np.random.uniform(size=[16384, 16384]).astype(np.float32)
+    threshold = np.median(inputs.min(axis=-1))
+    outputs = np.zeros([inputs.shape[1]], dtype=np.uint8)
+    input_buf = numpy_to_gpu(inputs)
+    output_buf = numpy_to_gpu(outputs)
+    with measure_time() as timer:
+        fn(
+            input_buf,
+            output_buf,
+            np.float32(threshold),
+            np.int64(inputs.shape[0]),
+            grid=(inputs.shape[1], 1, 1),
+            block=(1, 1, 1),
+        )
+    sync()
+    results = gpu_to_numpy(output_buf, outputs.shape, outputs.dtype)
+    expected = (inputs < threshold).any(axis=0)
+    print(f"took {timer()} seconds")
+    print(f"disagreement frac {np.mean((expected != results).astype(np.float32))}")
+    print(f"true frac {results.astype(np.float32).mean()}")
+
+
 if __name__ == "__main__":
-    reduction_bool_warp_vec()
+    reduction_trans_bool_naive()
