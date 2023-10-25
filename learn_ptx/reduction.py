@@ -101,5 +101,31 @@ def reduction_trans_bool_naive():
     print(f"true frac {results.astype(np.float32).mean()}")
 
 
+def reduction_trans_bool_blocked():
+    fn = compile_function(
+        "reduction_trans_bool_blocked.ptx", "reductionTransBoolBlocked"
+    )
+    inputs = np.random.uniform(size=[16384, 16384]).astype(np.float32)
+    threshold = np.median(inputs.min(axis=-1))
+    outputs = np.zeros([inputs.shape[1]], dtype=np.uint8)
+    input_buf = numpy_to_gpu(inputs)
+    output_buf = numpy_to_gpu(outputs)
+    with measure_time() as timer:
+        fn(
+            input_buf,
+            output_buf,
+            np.float32(threshold),
+            np.int64(inputs.shape[0]),
+            grid=(inputs.shape[1] // 256, 1, 1),
+            block=(256, 1, 1),
+        )
+    sync()
+    results = gpu_to_numpy(output_buf, outputs.shape, outputs.dtype)
+    expected = (inputs < threshold).any(axis=0)
+    print(f"took {timer()} seconds")
+    print(f"disagreement frac {np.mean((expected != results).astype(np.float32))}")
+    print(f"true frac {results.astype(np.float32).mean()}")
+
+
 if __name__ == "__main__":
-    reduction_trans_bool_naive()
+    reduction_trans_bool_blocked()
