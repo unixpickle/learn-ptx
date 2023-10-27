@@ -169,5 +169,39 @@ def reduction_all_max_naive_opt():
     assert results[0] == expected, f"{results[0]=} {expected=}"
 
 
+def reduction_all_max_multistep():
+    opt_reduce = compile_function(
+        "reduction_all_max_naive_opt.ptx", "reductionAllMaxNaiveOpt"
+    )
+    small_reduce = compile_function(
+        "reduction_all_max_naive.ptx", "reductionAllMaxNaive"
+    )
+    inputs = np.random.uniform(size=[16384**2]).astype(np.float32)
+    inputs[16384 * 8192 + 1337] = 1.5  # hide a needle in the haystack
+    outputs = np.zeros([1024], dtype=np.float32)
+    input_buf = numpy_to_gpu(inputs)
+    output_buf = numpy_to_gpu(outputs)
+    with measure_time() as timer:
+        opt_reduce(
+            input_buf,
+            output_buf,
+            np.int64((len(inputs) // 1024) // 1024),
+            grid=(1024, 1, 1),
+            block=(1024, 1, 1),
+        )
+        small_reduce(
+            output_buf,
+            output_buf,
+            np.int64(1),
+            grid=(1, 1, 1),
+            block=(1024, 1, 1),
+        )
+    sync()
+    results = gpu_to_numpy(output_buf, outputs.shape, outputs.dtype)
+    expected = np.max(inputs)
+    print(f"took {timer()} seconds")
+    assert results[0] == expected, f"{results[0]=} {expected=}"
+
+
 if __name__ == "__main__":
-    reduction_all_max_naive_opt()
+    reduction_all_max_multistep()
