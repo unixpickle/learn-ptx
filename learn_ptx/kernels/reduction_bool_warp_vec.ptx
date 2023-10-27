@@ -41,7 +41,7 @@
     mov.u32 %accumulation, 0;
 
 loop_start:
-    ldu.global.v4.f32 %ftmp, [%ptrIn];
+    ld.global.v4.f32 %ftmp, [%ptrIn];
     setp.lt.f32 %p0, %ftmp.w, %threshold;
     @%p0 mov.u32 %accumulation, 1;
     setp.lt.f32 %p0, %ftmp.x, %threshold;
