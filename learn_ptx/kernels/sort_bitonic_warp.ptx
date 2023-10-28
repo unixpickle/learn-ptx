@@ -1,0 +1,71 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry sortBitonicWarp (
+    .param .u64 ptr
+) {
+    .reg .pred %p0;
+    .reg .pred %reverse;
+
+    // Arguments
+    .reg .u64 %ptr;
+
+    // Cached thread properties
+    .reg .u32 %tidX;
+
+    // Other variables.
+    .reg .u64 %dtmp<2>;
+    .reg .u32 %stmp<2>;
+    .reg .u32 %i;
+    .reg .u32 %j;
+    .reg .f32 %val<2>;
+    .reg .f32 %otherVal;
+
+    // Load arguments and thread properties.
+    ld.param.u64 %ptr, [ptr];
+    mov.u32 %tidX, %tid.x;
+
+    cvt.u64.u32 %dtmp0, %ctaid.x;
+    shl.b64 %dtmp0, %dtmp0, 5;
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    shl.b64 %dtmp0, %dtmp0, 2; // 4*(ctaid.x*32 + tid.x)
+    add.u64 %ptr, %ptr, %dtmp0;
+    ld.global.f32 %val0, [%ptr];
+
+    mov.u32 %i, 0;
+loop_start:
+    // Flip the order of every other group to keep the data
+    // in bitonic order.
+    shl.b32 %stmp0, 2, %i;
+    and.b32 %stmp0, %tidX, %stmp0;
+    setp.ne.u32 %reverse, %stmp0, 0;
+
+    mov.u32 %j, %i;
+inner_loop_start:
+    // Our stride is 2^j;
+    shl.b32 %stmp0, 1, %j;
+
+    // Check if we are first, and then flip it based on %reverse.
+    and.b32 %stmp1, %tidX, %stmp0;
+    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+
+    shfl.sync.bfly.b32 %val1, %val0, %stmp0, 0x1f, 0xffffffff;
+    // Keep lower or higher value depending on circumstances.
+    setp.lt.xor.f32 %p0, %val0, %val1, %p0;
+    selp.f32 %val0, %val1, %val0, %p0;
+
+    setp.ne.u32 %p0, %j, 0;
+    sub.u32 %j, %j, 1;
+    @%p0 bra inner_loop_start;
+inner_loop_end:
+
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %p0, %i, 5;
+    @%p0 bra loop_start;
+loop_end:
+
+    st.global.f32 [%ptr], %val0;
+    ret;
+}
