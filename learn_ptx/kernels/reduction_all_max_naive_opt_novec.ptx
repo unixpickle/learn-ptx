@@ -1,0 +1,129 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry reductionAllMaxNaiveOptNoVec (
+    .param .u64 ptrIn,
+    .param .u64 ptrOut,
+    .param .u64 numBlocks
+) {
+    .reg .pred %p0;
+
+    // Arguments
+    .reg .u64 %ptrIn;
+    .reg .u64 %ptrOut;
+    .reg .u64 %numBlocks;
+
+    .reg .u64 %i;
+    .reg .f32 %curMax;
+    .reg .u64 %tmp0;
+    .reg .u32 %stmp<2>;
+    .reg .f32 %ftmp;
+    .reg .f32 %ftmpLoaded<8>;
+
+    .shared .align 4 .f32 results[32];
+
+    // Load arguments.
+    ld.param.u64 %ptrIn, [ptrIn];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.u64 %numBlocks, [numBlocks];
+
+    // We support multiple blocks in the case where multiple
+    // outputs are being written.
+    // Input is offset 1024*4*numBlocks*ctaid.x, output offset by 4*ctaid.x
+    cvt.u64.u32 %tmp0, %ctaid.x;
+    shl.b64 %tmp0, %tmp0, 2;
+    add.u64 %ptrOut, %ptrOut, %tmp0;
+    mul.lo.u64 %tmp0, %tmp0, %numBlocks;
+    shl.b64 %tmp0, %tmp0, 10;
+    add.u64 %ptrIn, %ptrIn, %tmp0;
+
+    // Each rank is offset by 16 bytes.
+    cvt.u64.u32 %tmp0, %tid.x;
+    shl.b64 %tmp0, %tmp0, 4;
+    add.u64 %ptrIn, %ptrIn, %tmp0;
+
+    // Base condition: use our output.
+    ld.global.f32 %curMax, [%ptrIn];
+
+    mov.u64 %i, 0;
+loop_start:
+    ld.global.f32 %ftmpLoaded0, [%ptrIn];
+    ld.global.f32 %ftmpLoaded1, [%ptrIn+4];
+    ld.global.f32 %ftmpLoaded2, [%ptrIn+8];
+    ld.global.f32 %ftmpLoaded3, [%ptrIn+12];
+    ld.global.f32 %ftmpLoaded4, [%ptrIn+16384];
+    ld.global.f32 %ftmpLoaded5, [%ptrIn+16388];
+    ld.global.f32 %ftmpLoaded6, [%ptrIn+16392];
+    ld.global.f32 %ftmpLoaded7, [%ptrIn+16396];
+    add.u64 %ptrIn, %ptrIn, 32768;
+    max.f32 %curMax, %curMax, %ftmpLoaded0;
+    max.f32 %curMax, %curMax, %ftmpLoaded1;
+    max.f32 %curMax, %curMax, %ftmpLoaded2;
+    max.f32 %curMax, %curMax, %ftmpLoaded3;
+    max.f32 %curMax, %curMax, %ftmpLoaded4;
+    max.f32 %curMax, %curMax, %ftmpLoaded5;
+    max.f32 %curMax, %curMax, %ftmpLoaded6;
+    max.f32 %curMax, %curMax, %ftmpLoaded7;
+    add.u64 %i, %i, 8;
+    setp.lt.u64 %p0, %i, %numBlocks;
+    @%p0 bra loop_start;
+loop_end:
+
+    // Synchronize on warp using a hypercube.
+    // https://en.wikipedia.org/wiki/Hypercube_(communication_pattern)
+    shfl.sync.bfly.b32 %ftmp, %curMax, 1, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 2, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 4, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 8, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 16, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+
+    // Our warp writes to results[tid.x//32].
+    mov.u32 %stmp0, results;
+    mov.u32 %stmp1, %tid.x;
+    shr.b32 %stmp1, %stmp1, 5;
+    shl.b32 %stmp1, %stmp1, 2;
+    add.u32 %stmp0, %stmp0, %stmp1;
+    // Only write from rank 0 of warp.
+    mov.u32 %stmp1, %tid.x;
+    and.b32 %stmp1, %stmp1, 31;
+    setp.eq.u32 %p0, %stmp1, 0;
+    @%p0 st.shared.f32 [%stmp0], %curMax;
+    bar.sync 0;
+
+    // Exit on all but first warp.
+    mov.u32 %stmp1, %tid.x;
+    and.b32 %stmp1, %stmp1, 992; // 1024 ^ 31
+    setp.eq.u32 %p0, %stmp1, 0;
+    @!%p0 ret;
+
+    // Reduce the shared memory from the first warp.
+    mov.u32 %stmp0, results;
+    mov.u32 %stmp1, %tid.x;
+    and.b32 %stmp1, %stmp1, 31;
+    shl.b32 %stmp1, %stmp1, 2;
+    add.u32 %stmp0, %stmp0, %stmp1;
+
+    ld.shared.f32 %curMax, [%stmp0];
+
+    shfl.sync.bfly.b32 %ftmp, %curMax, 1, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 2, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 4, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 8, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+    shfl.sync.bfly.b32 %ftmp, %curMax, 16, 0x1f, 0xffffffff;
+    max.f32 %curMax, %curMax, %ftmp;
+
+    setp.eq.u32 %p0, %stmp1, 0;
+    @%p0 st.global.f32 [%ptrOut], %curMax;
+
+    ret;
+}
