@@ -234,16 +234,20 @@ def reduction_all_max_flexible_multistep():
     #     "reduction_all_max_naive_opt_flexible_novec.ptx",
     #     "reductionAllMaxNaiveOptFlexibleNovec",
     # )
+    # opt_reduce = compile_function(
+    #     "reduction_all_max_naive_opt_flexible_widevec.ptx",
+    #     "reductionAllMaxNaiveOptFlexibleWidevec",
+    # )
     opt_reduce = compile_function(
-        "reduction_all_max_naive_opt_flexible_widevec.ptx",
-        "reductionAllMaxNaiveOptFlexibleWidevec",
+        "reduction_all_max_naive_opt_flexible_sin.ptx",
+        "reductionAllMaxNaiveOptFlexibleSin",
     )
     small_reduce = compile_function(
         "reduction_all_max_naive.ptx", "reductionAllMaxNaive"
     )
     inputs = np.random.uniform(size=[16384**2]).astype(np.float32)
     inputs[16384 * 8192 + 1337] = 1.5  # hide a needle in the haystack
-    expected = np.max(inputs)
+    expected = np.max(np.sin(inputs))
     outputs = np.zeros([1024], dtype=np.float32)
     input_buf = numpy_to_gpu(inputs)
     warp_values = [1, 2, 4, 8, 16, 32]
@@ -273,7 +277,7 @@ def reduction_all_max_flexible_multistep():
             results = gpu_to_numpy(output_buf, outputs.shape, outputs.dtype)
             rate = ((int(np.prod(inputs.shape)) * 4) / timer()) / (2**30)
             print(f"{n_warps=} {n_blocks=} GiB/s={rate}")
-            assert results[0] == expected, f"{results[0]=} {expected=}"
+            assert np.allclose(results[0], expected), f"{results[0]=} {expected=}"
             output_grid[i, j] = rate
     rows = [["", *[f"{i} warps" for i in warp_values]]]
     for label, row in zip(block_values, output_grid.T):
