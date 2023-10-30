@@ -227,8 +227,16 @@ def reduction_all_max_multistep():
 
 
 def reduction_all_max_flexible_multistep():
+    # opt_reduce = compile_function(
+    #     "reduction_all_max_naive_opt_flexible.ptx", "reductionAllMaxNaiveOptFlexible"
+    # )
+    # opt_reduce = compile_function(
+    #     "reduction_all_max_naive_opt_flexible_novec.ptx",
+    #     "reductionAllMaxNaiveOptFlexibleNovec",
+    # )
     opt_reduce = compile_function(
-        "reduction_all_max_naive_opt_flexible.ptx", "reductionAllMaxNaiveOptFlexible"
+        "reduction_all_max_naive_opt_flexible_widevec.ptx",
+        "reductionAllMaxNaiveOptFlexibleWidevec",
     )
     small_reduce = compile_function(
         "reduction_all_max_naive.ptx", "reductionAllMaxNaive"
