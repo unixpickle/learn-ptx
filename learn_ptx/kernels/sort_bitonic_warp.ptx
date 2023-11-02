@@ -20,7 +20,6 @@
     .reg .u32 %i;
     .reg .u32 %j;
     .reg .f32 %val<2>;
-    .reg .f32 %otherVal;
 
     // Load arguments and thread properties.
     ld.param.u64 %ptr, [ptr];

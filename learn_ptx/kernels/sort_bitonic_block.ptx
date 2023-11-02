@@ -1,0 +1,209 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry sortBitonicBlock (
+    .param .u64 ptr
+) {
+    .reg .pred %p0;
+    .reg .pred %upperHalf;
+    .reg .pred %reverse;
+
+    // Arguments
+    .reg .u64 %ptr;
+
+    // Cached thread properties
+    .reg .u32 %tidX;
+    .reg .u32 %tidY;
+
+    // Other variables.
+    .reg .u64 %dtmp<2>;
+    .reg .u32 %stmp<4>;
+    .reg .u32 %i;
+    .reg .u32 %j;
+    .reg .f32 %val<3>;
+
+    .shared .align 4 .f32 sortBuffer[1024];
+
+    // Load arguments and thread properties.
+    ld.param.u64 %ptr, [ptr];
+    mov.u32 %tidX, %tid.x;
+    mov.u32 %tidY, %tid.y;
+
+    cvt.u64.u32 %dtmp0, %ctaid.x;
+    shl.b64 %dtmp0, %dtmp0, 10;
+    cvt.u64.u32 %dtmp1, %tidY;
+    shl.b64 %dtmp1, %dtmp1, 5;
+    add.u64 %dtmp0, %dtmp0, %dtmp1; // (ctaid.x*1024 + tid.y*32)
+    cvt.u64.u32 %dtmp1, %tidX;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    shl.b64 %dtmp0, %dtmp0, 2; // 4*(ctaid.x*1024 + tid.y*32 + tid.x)
+    add.u64 %ptr, %ptr, %dtmp0;
+    ld.global.f32 %val0, [%ptr];
+
+    mov.u32 %i, 0;
+loop_start:
+    // Flip the order of every other group to keep the data
+    // in bitonic order.
+    shl.b32 %stmp0, 2, %i;
+    shl.b32 %stmp1, %tidY, 5;
+    add.u32 %stmp1, %stmp1, %tidX;
+    and.b32 %stmp0, %stmp1, %stmp0;
+    setp.ne.u32 %reverse, %stmp0, 0;
+
+    mov.u32 %j, %i;
+inner_loop_start:
+    // Our stride is 2^j;
+    shl.b32 %stmp0, 1, %j;
+
+    // Check if we are first, and then flip it based on %reverse.
+    and.b32 %stmp1, %tidX, %stmp0;
+    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+
+    shfl.sync.bfly.b32 %val1, %val0, %stmp0, 0x1f, 0xffffffff;
+    // Keep lower or higher value depending on circumstances.
+    setp.lt.xor.f32 %p0, %val0, %val1, %p0;
+    selp.f32 %val0, %val1, %val0, %p0;
+
+    setp.ne.u32 %p0, %j, 0;
+    sub.u32 %j, %j, 1;
+    @%p0 bra inner_loop_start;
+inner_loop_end:
+
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %p0, %i, 5;
+    @%p0 bra loop_start;
+loop_end:
+
+    // Our index in shared will be stmp0 = 4*(tidX + tidY*32)
+    // We start by storing the values so that each 32-float block
+    // is sorted.
+    shl.b32 %stmp0, %tidY, 5;
+    add.u32 %stmp0, %stmp0, %tidX;
+    shl.b32 %stmp0, %stmp0, 2;
+    mov.u32 %stmp1, sortBuffer;
+    add.u32 %stmp1, %stmp1, %stmp0;
+    st.shared.f32 [%stmp1], %val0;
+
+    // Skip work in second half of all warps while
+    // doing cross-shared-memory merging.
+    setp.gt.u32 %upperHalf, %tidY, 15;
+
+    // Sort from stride 32 to stride 512, by striding
+    // tid.y and doing the resulting indexing logic.
+    mov.u32 %i, 0;
+block_loop_start:
+    // Merge across warps, avoiding bank conflicts by reading
+    // consecutive values of at least 32 floats.
+    // This logic reads and writes two values from each warp,
+    // masking activity from the upper half of the block.
+    mov.u32 %j, %i;
+inner_block_loop_start:
+    // We will store a "virtual" tid.y in stmp2 by effectively
+    // moving bit %j to the 16 position (most significant digit).
+    //
+    // If tid.y % (1<<j) == 0, then we actually read the warp
+    // corresponding to tid.y and tid.y ^ (1<<j).
+    // Otherwise, we are doing the second half and we start at
+    // (tid.y^(1<<j))+16 and also do (tid.y + 16).
+    shl.b32 %stmp0, 1, %j;
+    mov.u32 %stmp2, %tidY;
+    and.b32 %stmp1, %stmp2, %stmp0;
+    xor.b32 %stmp2, %stmp2, %stmp1;
+    setp.ne.u32 %p0, %stmp1, 0;
+    @%p0 or.b32 %stmp2, %stmp2, 16;
+
+    // Decide if we are in the second or first half of the next
+    // stage's bitonic input.
+    // We do this inside the loop because, if i=3, then we will start the
+    // second half based on the extra bit we added to stmp2.
+    shl.b32 %stmp3, 2, %i;
+    and.b32 %stmp3, %stmp2, %stmp3;
+    setp.ne.u32 %reverse, %stmp3, 0;
+
+    // Compute two addresses for shared memory and store them into
+    // stmp0 and stmp3.
+    shl.b32 %stmp1, %stmp2, 5;
+    add.u32 %stmp1, %stmp1, %tidX;
+    shl.b32 %stmp1, %stmp1, 2;
+    mov.u32 %stmp3, sortBuffer;
+    add.u32 %stmp0, %stmp3, %stmp1;
+    // xor effective tid.y with (1 << j) to get second address
+    // note that we overwrite %stmp2 here.
+    shl.b32 %stmp2, 128, %j;
+    xor.b32 %stmp1, %stmp1, %stmp2;
+    add.u32 %stmp3, %stmp3, %stmp1;
+
+    bar.sync 0;
+
+    @!%upperHalf ld.shared.f32 %val0, [%stmp0];
+    @!%upperHalf ld.shared.f32 %val1, [%stmp3];
+
+    // Swap based on comparison, possibly reversing.
+    setp.gt.xor.f32 %p0, %val0, %val1, %reverse;
+    @%p0 mov.f32 %val2, %val0;
+    @%p0 mov.f32 %val0, %val1;
+    @%p0 mov.f32 %val1, %val2;
+
+    @!%upperHalf st.shared.f32 [%stmp0], %val0;
+    @!%upperHalf st.shared.f32 [%stmp3], %val1;
+
+    setp.ne.u32 %p0, %j, 0;
+    sub.u32 %j, %j, 1;
+    @%p0 bra inner_block_loop_start;
+inner_block_loop_end:
+
+    // We now must merge within each 32-float block, which we do per-warp
+    // to once again avoid bank conflicts.
+    // This looks very similar to the per-warp sorting logic we started with.
+    bar.sync 0;
+    shl.b32 %stmp0, %tidY, 5;
+    add.u32 %stmp0, %stmp0, %tidX;
+    shl.b32 %stmp0, %stmp0, 2;
+    mov.u32 %stmp1, sortBuffer;
+    add.u32 %stmp3, %stmp0, %stmp1;
+    ld.shared.f32 %val0, [%stmp3];
+
+    // We are in the second half based on the full tid.y.
+    shl.b32 %stmp0, 2, %i;
+    and.b32 %stmp0, %tidY, %stmp0;
+    setp.ne.u32 %reverse, %stmp0, 0;
+
+    mov.u32 %j, 4;
+stage2_inner_loop_start:
+    // Our stride is 2^j;
+    shl.b32 %stmp0, 1, %j;
+
+    // Check if we are first, and then flip it based on %reverse.
+    and.b32 %stmp1, %tidX, %stmp0;
+    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+
+    shfl.sync.bfly.b32 %val1, %val0, %stmp0, 0x1f, 0xffffffff;
+    // Keep lower or higher value depending on circumstances.
+    setp.lt.xor.f32 %p0, %val0, %val1, %p0;
+    selp.f32 %val0, %val1, %val0, %p0;
+
+    setp.ne.u32 %p0, %j, 0;
+    sub.u32 %j, %j, 1;
+    @%p0 bra stage2_inner_loop_start;
+stage2_inner_loop_end:
+
+    st.shared.f32 [%stmp3], %val0;
+
+    add.u32 %i, %i, 1;
+    setp.lt.u32 %p0, %i, 5;
+    @%p0 bra block_loop_start;
+block_loop_end:
+
+    // Store values back from shared memory.
+    bar.sync 0;
+    shl.b32 %stmp0, %tidY, 5;
+    add.u32 %stmp0, %stmp0, %tidX;
+    shl.b32 %stmp0, %stmp0, 2;
+    mov.u32 %stmp1, sortBuffer;
+    add.u32 %stmp0, %stmp0, %stmp1;
+    ld.shared.f32 %val0, [%stmp0];
+    st.global.f32 [%ptr], %val0;
+
+    ret;
+}
