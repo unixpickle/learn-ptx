@@ -2,35 +2,62 @@
 .target sm_50 // enough for my Titan X
 .address_size 64
 
-// Unrolled version of sort_bitonic_warp.ptx
+// Similar to sort_bitonic_warp_v2.py but with pre-computed
+// cached values of tidX & (1 << i), a larger block size, and
+// 
 
-.visible .entry sortBitonicWarpV2 (
-    .param .u64 ptr
+.visible .entry sortBitonicWarpV3 (
+    .param .u64 ptr,
+    .param .u64 count,
+    .param .u64 stride
 ) {
     .reg .pred %p0;
     .reg .pred %reverse;
 
     // Arguments
     .reg .u64 %ptr;
+    .reg .u64 %stride;
+    .reg .u64 %count;
 
     // Cached thread properties
     .reg .u32 %tidX;
+    .reg .u32 %tidY;
 
     // Other variables.
     .reg .u64 %dtmp<2>;
-    .reg .u32 %stmp<2>;
+    .reg .u32 %tidXAnd1;
+    .reg .u32 %tidXAnd2;
+    .reg .u32 %tidXAnd4;
+    .reg .u32 %tidXAnd8;
+    .reg .u32 %tidXAnd16;
+    .reg .u32 %tidXAnd32;
     .reg .f32 %val<2>;
 
     // Load arguments and thread properties.
     ld.param.u64 %ptr, [ptr];
+    ld.param.u64 %stride, [stride];
+    ld.param.u64 %count, [count];
     mov.u32 %tidX, %tid.x;
+    mov.u32 %tidY, %tid.y;
 
     cvt.u64.u32 %dtmp0, %ctaid.x;
-    shl.b64 %dtmp0, %dtmp0, 5;
+    shl.b64 %dtmp0, %dtmp0, 8;
+    cvt.u64.u32 %dtmp1, %tidY;
+    shl.b64 %dtmp1, %dtmp1, 5;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
     cvt.u64.u32 %dtmp1, %tidX;
     add.u64 %dtmp0, %dtmp0, %dtmp1;
-    shl.b64 %dtmp0, %dtmp0, 2; // 4*(ctaid.x*32 + tid.x)
+    shl.b64 %dtmp0, %dtmp0, 2; // 4*(ctaid.x*256 + tid.y*32 + tid.x)
     add.u64 %ptr, %ptr, %dtmp0;
+
+    and.b32 %tidXAnd1, %tidX, 1;
+    and.b32 %tidXAnd2, %tidX, 2;
+    and.b32 %tidXAnd4, %tidX, 4;
+    and.b32 %tidXAnd8, %tidX, 8;
+    and.b32 %tidXAnd16, %tidX, 16;
+    mov.u32 %tidXAnd32, 0;
+
+outer_loop_start:
     ld.global.f32 %val0, [%ptr];
 
 /*
@@ -38,13 +65,11 @@
 for i in range(5):
     print("")
     print(f"    // {i=}")
-    print(f"    and.b32 %stmp0, %tidX, {2 << i};")
-    print(f"    setp.ne.u32 %reverse, %stmp0, 0;")
+    print(f"    setp.ne.u32 %reverse, %tidXAnd{2 << i}, 0;")
 
     for j in range(i, -1, -1):
         print(f"    // {j=}")
-        print(f"    and.b32 %stmp1, %tidX, {1 << j};")
-        print(f"    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;")
+        print(f"    setp.eq.xor.u32 %p0, %tidXAnd{1 << j}, 0, %reverse;")
         print(f"    shfl.sync.bfly.b32 %val1, %val0, {1 << j}, 0x1f, 0xffffffff;")
         print(f"    setp.lt.xor.f32 %p0, %val0, %val1, %p0;")
         print(f"    selp.f32 %val0, %val1, %val0, %p0;")
@@ -52,117 +77,105 @@ for i in range(5):
 */
 
 loop_start:
+
     // i=0
-    and.b32 %stmp0, %tidX, 2;
-    setp.ne.u32 %reverse, %stmp0, 0;
+    setp.ne.u32 %reverse, %tidXAnd2, 0;
     // j=0
-    and.b32 %stmp1, %tidX, 1;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd1, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 1, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
- 
+
     // i=1
-    and.b32 %stmp0, %tidX, 4;
-    setp.ne.u32 %reverse, %stmp0, 0;
+    setp.ne.u32 %reverse, %tidXAnd4, 0;
     // j=1
-    and.b32 %stmp1, %tidX, 2;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd2, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 2, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=0
-    and.b32 %stmp1, %tidX, 1;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd1, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 1, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
- 
+
     // i=2
-    and.b32 %stmp0, %tidX, 8;
-    setp.ne.u32 %reverse, %stmp0, 0;
+    setp.ne.u32 %reverse, %tidXAnd8, 0;
     // j=2
-    and.b32 %stmp1, %tidX, 4;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd4, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 4, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=1
-    and.b32 %stmp1, %tidX, 2;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd2, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 2, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=0
-    and.b32 %stmp1, %tidX, 1;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd1, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 1, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
- 
+
     // i=3
-    and.b32 %stmp0, %tidX, 16;
-    setp.ne.u32 %reverse, %stmp0, 0;
+    setp.ne.u32 %reverse, %tidXAnd16, 0;
     // j=3
-    and.b32 %stmp1, %tidX, 8;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd8, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 8, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=2
-    and.b32 %stmp1, %tidX, 4;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd4, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 4, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=1
-    and.b32 %stmp1, %tidX, 2;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd2, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 2, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=0
-    and.b32 %stmp1, %tidX, 1;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd1, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 1, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
- 
+
     // i=4
-    and.b32 %stmp0, %tidX, 32;
-    setp.ne.u32 %reverse, %stmp0, 0;
+    setp.ne.u32 %reverse, %tidXAnd32, 0;
     // j=4
-    and.b32 %stmp1, %tidX, 16;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd16, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 16, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=3
-    and.b32 %stmp1, %tidX, 8;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd8, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 8, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=2
-    and.b32 %stmp1, %tidX, 4;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd4, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 4, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=1
-    and.b32 %stmp1, %tidX, 2;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd2, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 2, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
     // j=0
-    and.b32 %stmp1, %tidX, 1;
-    setp.eq.xor.u32 %p0, %stmp1, 0, %reverse;
+    setp.eq.xor.u32 %p0, %tidXAnd1, 0, %reverse;
     shfl.sync.bfly.b32 %val1, %val0, 1, 0x1f, 0xffffffff;
     setp.lt.xor.f32 %p0, %val0, %val1, %p0;
     selp.f32 %val0, %val1, %val0, %p0;
 loop_end:
 
     st.global.f32 [%ptr], %val0;
+
+    sub.u64 %count, %count, 1;
+    add.u64 %ptr, %ptr, %stride;
+    setp.ne.u64 %p0, %count, 0;
+    @%p0 bra outer_loop_start;
+outer_loop_end:
+
     ret;
 }
