@@ -1,3 +1,4 @@
+import time
 from math import ceil
 
 import numpy as np
@@ -94,5 +95,45 @@ def sort_bitonic_block_v2():
     assert np.allclose(results, expected), f"\n{results=}\n{expected=}"
 
 
+def sort_merge_global():
+    warp_fn = compile_function("sort_bitonic_warp_v2.ptx", "sortBitonicWarpV2")
+    global_fn = compile_function("sort_merge_global.ptx", "sortMergeGlobal")
+    inputs = np.random.normal(size=[2**28]).astype(np.float32)
+    tmp = np.zeros_like(inputs)
+    input_buf = numpy_to_gpu(inputs)
+    tmp_buf = numpy_to_gpu(tmp)
+    num_el = int(np.prod(inputs.shape))
+    print("sorting on GPU...")
+    with measure_time() as timer:
+        # Sort per warp before merging.
+        warp_fn(
+            input_buf,
+            grid=(num_el // 32, 1, 1),
+            block=(32, 1, 1),
+        )
+        n_sorted = 32
+        while n_sorted < num_el:
+            # Maximum of 8 warps per block, to maximize occupancy when possible.
+            concurrency = min(num_el // (2 * n_sorted), 8)
+            grid_size = num_el // (2 * n_sorted * concurrency)
+            global_fn(
+                input_buf,
+                tmp_buf,
+                np.int64(n_sorted),
+                grid=(grid_size, 1, 1),
+                block=(32, concurrency, 1),
+            )
+            input_buf, tmp_buf = tmp_buf, input_buf
+            n_sorted *= 2
+    sync()
+    results = gpu_to_numpy(input_buf, inputs.shape, inputs.dtype)
+    print("sorting on CPU...")
+    t1 = time.time()
+    expected = np.sort(inputs, axis=-1)
+    t2 = time.time()
+    print(f"took {timer()} seconds on GPU and {t2 - t1} seconds on CPU")
+    assert np.allclose(results, expected), f"\n{results=}\n{expected=}"
+
+
 if __name__ == "__main__":
-    sort_bitonic_block_v2()
+    sort_merge_global()

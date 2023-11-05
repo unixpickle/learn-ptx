@@ -1,0 +1,200 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+.visible .entry sortMergeGlobal (
+    .param .u64 ptr,
+    .param .u64 ptrOut,
+    .param .u64 chunkSize
+) {
+    .reg .pred %p<2>;
+
+    // Arguments
+    .reg .u64 %ptr;
+    .reg .u64 %ptrOut;
+    .reg .u64 %chunkSize;
+
+    // Other variables.
+    .reg .u64 %tidX;
+    .reg .u64 %ptrA;
+    .reg .u64 %ptrB;
+    .reg .u32 %curWarpA;
+    .reg .u32 %curWarpB;
+    .reg .u64 %remainingA;
+    .reg .u64 %remainingB;
+    .reg .u64 %dtmp<2>;
+    .reg .u64 %i;
+
+    // Stored values per warp rank.
+    .reg .f32 %valA;
+    .reg .f32 %valB;
+    .reg .f32 %valOut;
+
+    // Shared across warp.
+    .reg .f32 %curA;
+    .reg .f32 %curB;
+
+    // Load arguments and thread properties.
+    ld.param.u64 %ptr, [ptr];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.u64 %chunkSize, [chunkSize];
+
+    cvt.u64.u32 %tidX, %tid.x;
+
+    // Compute offset of chunk in buffer as &ptr[(ctaid.x*ntid.y + tid.y)*chunkSize*2 + tid.x]
+    cvt.u64.u32 %dtmp0, %ctaid.x;
+    cvt.u64.u32 %dtmp1, %ntid.y;
+    mul.lo.u64 %dtmp0, %dtmp0, %dtmp1;
+    cvt.u64.u32 %dtmp1, %tid.y;
+    add.u64 %dtmp0, %dtmp0, %dtmp1;
+    mul.lo.u64 %dtmp0, %dtmp0, %chunkSize;
+    shl.b64 %dtmp0, %dtmp0, 1;
+    add.u64 %dtmp0, %dtmp0, %tidX;
+    shl.b64 %dtmp0, %dtmp0, 2; // float -> byte offset
+
+    add.u64 %ptrA, %ptr, %dtmp0;
+    shl.b64 %dtmp1, %chunkSize, 2;
+    add.u64 %ptrB, %ptrA, %dtmp1;
+    add.u64 %ptrOut, %ptrOut, %dtmp0;
+
+    mov.u64 %remainingA, %chunkSize;
+    mov.u64 %remainingB, %chunkSize;
+    mov.u32 %curWarpA, 0;
+    mov.u32 %curWarpB, 0;
+
+    // Load the first chunk.
+    ld.global.f32 %valA, [%ptrA];
+    ld.global.f32 %valB, [%ptrB];
+    shfl.sync.idx.b32 %curA, %valA, 0, 0x1f, 0xffffffff;
+    shfl.sync.idx.b32 %curB, %valB, 0, 0x1f, 0xffffffff;
+
+    mov.u64 %i, 0;
+merge_loop:
+    // Set %p0 if we are storing into our current rank.
+    and.b64 %dtmp0, %i, 31;
+    setp.eq.u64 %p0, %dtmp0, %tidX;
+
+    setp.gt.f32 %p1, %curA, %curB;
+    @%p1 bra selected_B;
+    selected_A:
+        @%p0 mov.f32 %valOut, %curA;
+        sub.u64 %remainingA, %remainingA, 1;
+        add.u32 %curWarpA, %curWarpA, 1;
+        setp.lt.u32 %p0, %curWarpA, 32;
+        @%p0 bra reload_A_done;
+        reload_A:
+            setp.eq.u64 %p0, %remainingA, 0;
+            @%p0 bra done_selecting;
+            mov.u32 %curWarpA, 0;
+            add.u64 %ptrA, %ptrA, 128; // 32*4
+            ld.global.f32 %valA, [%ptrA];
+            prefetch.global.L1 [%ptrA+128];
+        reload_A_done:
+        shfl.sync.idx.b32 %curA, %valA, %curWarpA, 0x1f, 0xffffffff;
+        bra done_selecting;
+    selected_B:
+        @%p0 mov.f32 %valOut, %curB;
+        sub.u64 %remainingB, %remainingB, 1;
+        add.u32 %curWarpB, %curWarpB, 1;
+        setp.lt.u32 %p0, %curWarpB, 32;
+        @%p0 bra reload_B_done;
+        reload_B:
+            setp.eq.u64 %p0, %remainingB, 0;
+            @%p0 bra done_selecting;
+            mov.u32 %curWarpB, 0;
+            add.u64 %ptrB, %ptrB, 128; // 32*4
+            ld.global.f32 %valB, [%ptrB];
+            prefetch.global.L1 [%ptrB+128];
+        reload_B_done:
+        shfl.sync.idx.b32 %curB, %valB, %curWarpB, 0x1f, 0xffffffff;
+    done_selecting:
+
+    // Store all values every time the warp fills up.
+    setp.eq.u64 %p0, %dtmp0, 31;
+    @!%p0 bra store_warp_done;
+    store_warp:
+        st.global.f32 [%ptrOut], %valOut;
+        add.u64 %ptrOut, %ptrOut, 128;
+    store_warp_done:
+
+    add.u64 %i, %i, 1;
+
+    // Break out of main loop and enter specific
+    // copy mode if one of the halves is depleted.
+    setp.eq.u64 %p0, %remainingA, 0;
+    @%p0 bra copy_B_loop;
+    setp.eq.u64 %p0, %remainingB, 0;
+    @%p0 bra copy_A_loop;
+
+    bra merge_loop;
+
+merge_loop_end:
+
+copy_A_loop:
+    and.b64 %dtmp0, %i, 31;
+    setp.eq.u64 %p0, %dtmp0, %tidX;
+    @%p0 mov.f32 %valOut, %curA;
+
+    setp.eq.u64 %p0, %dtmp0, 31;
+    @!%p0 bra store_warp_A_done;
+    store_warp_A:
+        st.global.f32 [%ptrOut], %valOut;
+        add.u64 %ptrOut, %ptrOut, 128; // 32*4
+    store_warp_A_done:
+
+    sub.u64 %remainingA, %remainingA, 1;
+    add.u32 %curWarpA, %curWarpA, 1;
+    setp.lt.u32 %p0, %curWarpA, 32;
+    @%p0 bra reload_A_done_2;
+    reload_A_2:
+        setp.eq.u64 %p0, %remainingA, 0;
+        @%p0 bra skip_shfl_A;
+        mov.u32 %curWarpA, 0;
+        add.u64 %ptrA, %ptrA, 128; // 32*4
+        ld.global.f32 %valA, [%ptrA];
+        prefetch.global.L1 [%ptrA+128];
+    reload_A_done_2:
+    shfl.sync.idx.b32 %curA, %valA, %curWarpA, 0x1f, 0xffffffff;
+    skip_shfl_A:
+
+    setp.eq.u64 %p0, %remainingA, 0;
+    @%p0 bra copy_loops_end;
+    add.u64 %i, %i, 1;
+    bra copy_A_loop;
+
+copy_B_loop:
+    and.b64 %dtmp0, %i, 31;
+    setp.eq.u64 %p0, %dtmp0, %tidX;
+    @%p0 mov.f32 %valOut, %curB;
+
+    setp.eq.u64 %p0, %dtmp0, 31;
+    @!%p0 bra store_warp_B_done;
+    store_warp_B:
+        st.global.f32 [%ptrOut], %valOut;
+        add.u64 %ptrOut, %ptrOut, 128; // 32*4
+    store_warp_B_done:
+
+    sub.u64 %remainingB, %remainingB, 1;
+    add.u32 %curWarpB, %curWarpB, 1;
+    setp.lt.u32 %p0, %curWarpB, 32;
+    @%p0 bra reload_B_done_2;
+    reload_B_2:
+        setp.eq.u64 %p0, %remainingB, 0;
+        @%p0 bra skip_shfl_B;
+        mov.u32 %curWarpB, 0;
+        add.u64 %ptrB, %ptrB, 128; // 32*4
+        ld.global.f32 %valB, [%ptrB];
+        prefetch.global.L1 [%ptrB+128];
+    reload_B_done_2:
+    shfl.sync.idx.b32 %curB, %valB, %curWarpB, 0x1f, 0xffffffff;
+    skip_shfl_B:
+
+    setp.eq.u64 %p0, %remainingB, 0;
+    @%p0 bra copy_loops_end;
+    add.u64 %i, %i, 1;
+    bra copy_B_loop;
+
+copy_loops_end:
+
+    ret;
+}
