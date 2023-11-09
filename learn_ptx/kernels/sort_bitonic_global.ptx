@@ -1,0 +1,83 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+// Kernel for global bitonic sorting across a large buffer.
+
+.visible .entry sortBitonicGlobal (
+    .param .u64 ptr,
+    .param .u64 chunkSize,
+    .param .u32 crossover
+) {
+    .reg .pred %p0;
+
+    // Arguments
+    .reg .u64 %ptr;
+    .reg .u64 %chunkSize;
+    .reg .pred %crossover;
+
+    // Addresses for two values to swap.
+    .reg .u64 %ptrLower;
+    .reg .u64 %ptrUpper;
+
+    // Used for storing values.
+    .reg .f32 %valA;
+    .reg .f32 %valB;
+
+    // Load arguments and thread properties.
+    ld.param.u64 %ptr, [ptr];
+    ld.param.u64 %chunkSize, [chunkSize];
+    {
+        .reg .u32 %tmp;
+        ld.param.u32 %tmp, [crossover];
+        setp.ne.u32 %crossover, %tmp, 0;
+    }
+
+    // Offset in buffer is based on thread ID.
+    // Each chunkSize/2 threads handles one chunk,
+    // and each thread swaps two values.
+    {
+        .reg .u64 %ntidX;
+        .reg .u64 %ctaidX;
+        .reg .u64 %tidX;
+        .reg .u64 %globalIdx;
+        .reg .u64 %halfChunkSize;
+        .reg .u64 %chunkIdx;
+        .reg .u64 %indexInChunk;
+        .reg .u64 %tmp<6>;
+        cvt.u64.u32 %tidX, %tid.x;
+        cvt.u64.u32 %ctaidX, %ctaid.x;
+        cvt.u64.u32 %ntidX, %ntid.x;
+        mul.lo.u64 %globalIdx, %ctaidX, %ntidX;
+        add.u64 %globalIdx, %globalIdx, %tidX;
+        shr.b64 %halfChunkSize, %chunkSize, 1;
+        div.u64 %chunkIdx, %globalIdx, %halfChunkSize;
+        rem.u64 %indexInChunk, %globalIdx, %halfChunkSize;
+
+        mul.lo.u64 %tmp0, %chunkIdx, %chunkSize;
+        add.u64 %tmp1, %tmp0, %indexInChunk;
+        shl.b64 %tmp2, %tmp1, 2;
+        add.u64 %ptrLower, %ptr, %tmp2;
+
+        @%crossover sub.u64 %indexInChunk, %halfChunkSize, %indexInChunk;
+        @%crossover sub.u64 %indexInChunk, %indexInChunk, 1;
+        add.u64 %tmp3, %tmp0, %halfChunkSize;
+        add.u64 %tmp4, %tmp3, %indexInChunk;
+        shl.b64 %tmp5, %tmp4, 2;
+        add.u64 %ptrUpper, %ptr, %tmp5;
+    }
+
+    ld.global.f32 %valA, [%ptrLower];
+    ld.global.f32 %valB, [%ptrUpper];
+    setp.gt.f32 %p0, %valA, %valB;
+    {
+        .reg .f32 %tmp;
+        @%p0 mov.f32 %tmp, %valA;
+        @%p0 mov.f32 %valA, %valB;
+        @%p0 mov.f32 %valB, %tmp;
+    }
+    st.global.f32 [%ptrLower], %valA;
+    st.global.f32 [%ptrUpper], %valB;
+
+    ret;
+}
