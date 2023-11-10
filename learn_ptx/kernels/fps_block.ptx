@@ -1,0 +1,243 @@
+.version 7.0
+.target sm_50 // enough for my Titan X
+.address_size 64
+
+// Perform farthest point sampling with a single block.
+// Takes buffer of points, temporary buffer of distances,
+// and output pointer.
+
+.visible .entry sortBitonicGlobal (
+    .param .u64 ptrIn,
+    .param .u64 tmpBuffer,
+    .param .u64 ptrOut,
+    .param .u64 inCount,
+    .param .u64 outCount,
+) {
+    .reg .pred %p0;
+
+    // Arguments
+    .reg .u64 %ptrIn;
+    .reg .u64 %tmpBuffer;
+    .reg .u64 %ptrOut;
+    .reg .u64 %inCount;
+    .reg .u64 %outCount;
+    .reg .u64 %tidX;
+    .reg .u64 %blockSize;
+
+    // Buffers for communicating indices across warps.
+    .shared .align 4 .f32 largestDist[32];
+    .shared .align 8 .u64 largestIndex[32];
+
+    // Load arguments and thread properties.
+    ld.param.u64 %ptrIn, [ptrIn];
+    ld.param.u64 %tmpBuffer, [tmpBuffer];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.u64 %inCount, [inCount];
+    ld.param.u64 %outCount, [outCount];
+
+    cvt.u64.u32 %tidX, %tid.x;
+    cvt.u64.u32 %blockSize, %ntid.x;
+
+    // Select the first point.
+    {
+        .reg .f32 %firstPointX;
+        .reg .f32 %firstPointY;
+        .reg .f32 %firstPointZ;
+        ldu.global.f32.v2 {%firstPointX, %firstPointY}, [%ptrIn];
+        ldu.global.f32 %firstPointZ, [%ptrIn+8];
+
+        // Only store the output from the first rank.
+        setp.eq.u64 %p0, %tidX, 0;
+        @%p0 st.global.f32.v2 [%ptrOut], {%firstPointX, %firstPointY};
+        @%p0 st.global.f32 [%ptrOut+8], %firstPointZ;
+
+        // Populate the distances to the first point.
+        .reg .u64 %i;
+        .reg .u64 %curIn;
+        .reg .u64 %curOut;
+        .reg .u64 %strideIn;
+        .reg .u64 %strideOut;
+        .reg .f32 %tmpPointX;
+        .reg .f32 %tmpPointY;
+        .reg .f32 %tmpPointZ;
+        .reg .f32 %ftmp<3>;
+        mov.u64 %i, 0;
+        mul.lo.u64 %curIn, %tidX, 12;
+        add.u64 %curIn, %ptrIn, %curIn;
+        shl.b64 %curOut, %tidX, 2;
+        add.u64 %curOut, %tmpBuffer, %curOut;
+        mul.lo.u64 %stride, %blockSize, 12;
+        populate_loop:
+            setp.lt.u64 %p0, %i, %inCount;
+            @%p0 ld.global.f32.v2 {%tmpPointX, %tmpPointY}, [%curIn];
+            @%p0 ld.global.f32 %tmpPointZ, [%curIn+8];
+
+            // Squared euclidean distance.
+            sub.f32 %ftmp0, %firstPointX, %tmpPointX;
+            sub.f32 %ftmp1, %firstPointY, %tmpPointY;
+            sub.f32 %ftmp2, %firstPointZ, %tmpPointZ;
+            mul.f32 %ftmp0, %ftmp0, %ftmp0;
+            fma.f32 %ftmp0, %ftmp1, %ftmp1, %ftmp0;
+            fma.f32 %ftmp0, %ftmp2, %ftmp2, %ftmp0;
+            @%p0 st.global.f32 [%curOut], %ftmp0;
+
+            add.u64 %curIn, %curIn, %strideIn;
+            add.u64 %curOut, %curOut, %strideOut;
+            add.u64 %i, %i, %blockSize;
+            setp.lt.u64 %p0, %i, %inCount;
+            @%p0 bra.uni populate_loop;
+        populate_loop_end:
+    }
+
+    // Make the first distance negative so we never pick it again.
+    setp.eq.u64 %p0, %tidX, 0;
+    @%p0 st.global.f32 [%tmpBuffer], -1.0;
+
+    // Loop until we have exhausted all points.
+    {
+        .reg .u64 %i;
+        mov.u64 %i, 1;
+
+        loop_start:
+            setp.le.u64 %p0, %i, %outCount;
+            @!%p0 bra.uni loop_end;
+
+            // Find the maximum distance across the entire block.
+            .reg .u64 %nextIndex;
+            {
+                .reg .u64 %j;
+                .reg .u64 %offset;
+                .reg .u64 %bufferAddr;
+                .reg .f32 %localMaxValue;
+                .reg .u64 %localMaxIndex;
+                .reg .f32 %curValue;
+                mov.f32 %localMaxValue, -0.5;
+                mov.u64 %localMaxIndex, %tidX;
+                mov.u64 %j, 0;
+                read_distances_loop_start:
+                    add.u64 %offset, %j, %tidX;
+                    setp.lt.u64 %p0, %offset, %inCount;
+                    shl.b64 %bufferAddr, %offset, 2;
+                    add.u32 %bufferAddr, %bufferAddr, %tmpBuffer;
+                    @%p0 ld.global.f32 %curValue, [%bufferAddr];
+                    setp.gt.and.f32 %p0, %curValue, %localMaxValue, %p0;
+                    @%p0 mov.u64 %localMaxValue, %curValue;
+                    @%p0 mov.u64 %localMaxIndex, %offset;
+                    add.u64 %j, %j, %blockSize;
+                    setp.lt.u64 %p0, %j, %inCount;
+                    @%p0 bra.uni read_distances_loop_start;
+                read_distances_loop_end:
+
+                .reg .pred %p1;
+                .reg .u32 %xorMask;
+                .reg .f32 %otherMaxValue;
+                .reg .u32 %otherMaxIndex0;
+                .reg .u32 %otherMaxIndex1;
+                .reg .u64 %otherMaxIndex;
+                mov.u32 %bitIndex, 0;
+                reduction_loop:
+                    shl.b32 %xorMask, 1, %bitIndex;
+                    shfl.sync.bfly.b32 %otherMaxValue, %localMaxValue, %xorMask, 0x1f, 0xffffffff;
+                    mov.u64 {%otherMaxIndex1, %otherMaxIndex0}, %localMaxIndex;
+                    shfl.sync.bfly.b32 %otherMaxIndex0, %otherMaxIndex0, %xorMask, 0x1f, 0xffffffff;
+                    shfl.sync.bfly.b32 %otherMaxIndex1, %otherMaxIndex1, %xorMask, 0x1f, 0xffffffff;
+                    mov.u64 %otherMaxIndex, {%otherMaxIndex0, %otherMaxIndex1};
+                    // Keep other value if it's greater or if it has a lower
+                    // index and is equal.
+                    setp.eq.f32 %p0, %localMaxValue, %otherMax;
+                    setp.lt.and.u64 %p0, %otherMaxIndex, %localMaxIndex, %p0;
+                    setp.gt.or.f32 %p0, %otherMaxValue, %localMaxValue, %p0;
+                    @%p0 mov.u64 %localMaxIndex, %otherMaxIndex;
+                    @%p0 mov.u64 %localMaxValue, %otherMaxValue;
+                    add.u32 %bitIndex, %bitIndex, 1;
+                    setp.lt.u32 %p0, %bitIndex, 5;
+                    @%p0 bra.uni reduction_loop;
+                reduction_loop_end:
+
+                // Sync before overwriting shared buffer.
+                bar.sync 0;
+
+                .reg .u32 %sharedAddr;
+                .reg .u32 %sharedOffset;
+                .reg .u32 %warpIndex;
+                .reg .u32 %threadInWarp;
+                cvt.u32.u64 %warpIndex, %tidX;
+                and.u32 %threadInWarp, %warpIndex, 0x1f;
+                shr.b32 %warpIndex, %warpIndex, 5;
+
+                // Write one output per warp.
+                setp.eq.u32 %p0, %threadInWarp, 0;
+                mov.u32 %sharedAddr, largestDist;
+                shl.b32 %sharedOffset, %warpIndex, 2;
+                add.u32 %sharedAddr, %sharedAddr, %sharedOffset;
+                @%p0 st.shared.f32 [%sharedAddr], %localMaxValue;
+                mov.u32 %sharedAddr, largestIndex;
+                shl.b32 %sharedOffset, %warpIndex, 3;
+                add.u32 %sharedAddr, %sharedAddr, %sharedOffset;
+                @%p0 st.shared.u64 [%sharedAddr], %localMaxIndex;
+
+                // Make sure all writes are finished.
+                bar.sync 0;
+
+                // Read the entire shared buffer on each warp.
+                // Each warp will now have an independent copy of the
+                // exact same values to reduce.
+                mov.u32 %sharedAddr, largestDist;
+                shl.b32 %sharedOffset, %threadInWarp, 2;
+                add.u32 %sharedAddr, %sharedAddr, %sharedOffset;
+                ld.shared.f32 %localMaxValue, [%sharedAddr];
+                mov.u32 %sharedAddr, largestIndex;
+                shl.b32 %sharedOffset, %threadInWarp, 3;
+                add.u32 %sharedAddr, %sharedAddr, %sharedOffset;
+                ld.shared.u64 %localMaxIndex, [%sharedAddr];
+
+                // Perform another reduction across the warp.
+                mov.u32 %bitIndex, 0;
+                reduction_loop_1:
+                    shl.b32 %xorMask, 1, %bitIndex;
+                    shfl.sync.bfly.b32 %otherMaxValue, %localMaxValue, %xorMask, 0x1f, 0xffffffff;
+                    mov.u64 {%otherMaxIndex1, %otherMaxIndex0}, %localMaxIndex;
+                    shfl.sync.bfly.b32 %otherMaxIndex0, %otherMaxIndex0, %xorMask, 0x1f, 0xffffffff;
+                    shfl.sync.bfly.b32 %otherMaxIndex1, %otherMaxIndex1, %xorMask, 0x1f, 0xffffffff;
+                    mov.u64 %otherMaxIndex, {%otherMaxIndex0, %otherMaxIndex1};
+                    // Keep other value if it's greater or if it has a lower
+                    // index and is equal.
+                    setp.eq.f32 %p0, %localMaxValue, %otherMax;
+                    setp.lt.and.u64 %p0, %otherMaxIndex, %localMaxIndex, %p0;
+                    setp.gt.or.f32 %p0, %otherMaxValue, %localMaxValue, %p0;
+                    @%p0 mov.u64 %localMaxIndex, %otherMaxIndex;
+                    @%p0 mov.u64 %localMaxValue, %otherMaxValue;
+                    add.u32 %bitIndex, %bitIndex, 1;
+                    setp.lt.u32 %p0, %bitIndex, 5;
+                    @%p0 bra.uni reduction_loop_1;
+                reduction_loop_1_end:
+
+                mov.u64 %nextIndex, %localMaxIndex;
+            }
+
+            {
+                // Write the point at %nextIndex on all ranks.
+                .reg .f32 %nextPointX;
+                .reg .f32 %nextPointY;
+                .reg .f32 %nextPointZ;
+
+                {
+                    .reg .u64 %nextPointAddr;
+                    mul.lo.u64 %nextPointAddr, %nextIndex, 12;
+                    add.u64 %nextPointAddr, %ptrIn, %nextPointAddr;
+                    ldu.global.v2.f32 {%nextPointX, %nextPointY}, [%nextPointAddr];
+                    ldu.global.f32 %nextPointZ, [%nextPointAddr+8];
+                }
+
+                // TODO: write next point to output buffer.
+                // TODO: compute all distances and take minimum.
+                // TODO: write -1 to the distance of the current point from rank 0.
+            }
+
+            add.u64 %i, %i, 1;
+            // TODO: loop criterion
+        loop_end:
+    }
+
+    ret;
+}
