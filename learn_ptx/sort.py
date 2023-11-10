@@ -173,5 +173,46 @@ def sort_bitonic_global():
     assert np.allclose(results, expected), f"\n{results=}\n{expected=}"
 
 
+def sort_bitonic_global_v2():
+    warp_fn = compile_function("sort_bitonic_warp_v2.ptx", "sortBitonicWarpV2")
+    global_fn = compile_function("sort_bitonic_global_v2.ptx", "sortBitonicGlobalV2")
+    inputs = np.random.normal(size=[2**28]).astype(np.float32)
+    input_buf = numpy_to_gpu(inputs)
+    num_el = int(np.prod(inputs.shape))
+    print("sorting on GPU...")
+    with measure_time() as timer:
+        # Sort per warp before merging.
+        warp_fn(
+            input_buf,
+            grid=(num_el // 32, 1, 1),
+            block=(32, 1, 1),
+        )
+        block_size = 64
+        while block_size <= num_el:
+            sub_block_size = block_size
+            while sub_block_size > 1:
+                global_fn(
+                    input_buf,
+                    np.int64(sub_block_size),
+                    np.int32(sub_block_size == block_size),
+                    grid=((len(inputs) // 256) // 2, 1, 1),
+                    block=(256, 1, 1),
+                )
+                if sub_block_size <= 512:
+                    # Block should have completed the sort.
+                    break
+                sub_block_size //= 2
+            block_size *= 2
+    sync()
+    results = gpu_to_numpy(input_buf, inputs.shape, inputs.dtype)
+    print("sorting on CPU...")
+    t1 = time.time()
+    expected = np.sort(inputs, axis=-1)
+    t2 = time.time()
+    print(f"took {timer()} seconds on GPU and {t2 - t1} seconds on CPU")
+    assert np.allclose(results, expected), f"\n{results=}\n{expected=}"
+
+
 if __name__ == "__main__":
     sort_bitonic_global()
+    sort_bitonic_global_v2()
