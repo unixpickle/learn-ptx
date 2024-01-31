@@ -1,0 +1,140 @@
+.version 7.0
+.target sm_80 // needed for wmma instruction
+.address_size 64
+
+// A matrix multiplication that uses warp-level communication.
+// Multiplies 32x32 blocks using four warps (128 threads).
+// Each warp produces a 16x16 chunk and writes the output at the end.
+// Does not use shared memory, instead relies on L1/L2 cache.
+
+.visible .entry wmmaMatmulV1 (
+    .param .u64 ptrA,
+    .param .u64 ptrB,
+    .param .u64 ptrOut,
+    .param .u32 numBlocks
+) {
+    .reg .pred %p0;
+
+    // Attributes of the thread/CTA.
+    .reg .u32 %tidX;
+    .reg .u32 %tidY;
+    .reg .u64 %ctaX;
+    .reg .u64 %ctaY;
+
+    // Arguments
+    .reg .u64 %ptrA;
+    .reg .u64 %ptrB;
+    .reg .u64 %ptrOut;
+    .reg .u32 %numBlocks;
+
+    ld.param.u64 %ptrA, [ptrA];
+    ld.param.u64 %ptrB, [ptrB];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.u32 %numBlocks, [numBlocks];
+
+    mov.u32 %tidX, %tid.x; // index in warp (0-32)
+    mov.u32 %tidY, %tid.y; // warp index in block (0-4)
+    cvt.u64.u32 %ctaX, %ctaid.x; // column of output
+    cvt.u64.u32 %ctaY, %ctaid.y; // row of output
+
+    // Accumulation registers are stored as 8 floats per thread.
+    .reg .f32 %out<8>;
+    mov.f32 %out0, 0.0;
+    mov.f32 %out1, 0.0;
+    mov.f32 %out2, 0.0;
+    mov.f32 %out3, 0.0;
+    mov.f32 %out4, 0.0;
+    mov.f32 %out5, 0.0;
+    mov.f32 %out6, 0.0;
+    mov.f32 %out7, 0.0;
+
+    // The row-wise stride of the matrices, measured in tf32's.
+    .reg .u32 %stride32;
+    .reg .u64 %stride;
+    shl.b32 %stride32, %numBlocks, 5;
+    cvt.u64.u32 %stride, %stride32;
+
+    // We will use pointerInA to point to the top-left corner of our warp's
+    // block in A. Both warp 0 and 1 will have the same pointer.
+    // We will advance this by 8 every time we load some values and do a matmul.
+    .reg .u64 %pointerInA;
+    {
+        .reg .u64 %tmp;
+        shl.b64 %tmp, %stride, 7; // 4 bytes per float * 32 rows
+        mul.lo.u64 %tmp, %tmp, %ctaY;
+        add.u64 %pointerInA, %ptrA, %tmp;
+
+        // Add row offset for second half of the block.
+        cvt.u64.u32 %tmp, %tidY;
+        and.b64 %tmp, %tmp, 2; // 2 if second row of block, 0 if first
+        mul.lo.u64 %tmp, %tmp, %stride;
+        shl.b64 %tmp, %tmp, 5; // Offset of thread is (16 rows)*stride*(4 bytes) = stride << (4 + 2)
+        add.u64 %pointerInA, %pointerInA, %tmp;
+    }
+
+    // pointerInB is like pointerInA, except that we advance it by row rather than
+    // by column.
+    .reg .u64 %pointerInB;
+    .reg .u64 %strideB;
+    {
+        .reg .u64 %tmp;
+        shl.b64 %tmp, %ctaX, 7; // 4 bytes per float * 32 columns
+        add.u64 %pointerInB, %ptrB, %tmp;
+
+        // Add column offset for relevant parts of the block.
+        cvt.u64.u32 %tmp, %tidY;
+        and.b64 %tmp, %tmp, 1; // 1 if second column of block, 0 if first
+        shl.b64 %tmp, %tmp, 6; // 16 floats * 4 bytes
+        add.u64 %pointerInB, %pointerInB, %tmp;
+
+        shl.b64 %strideB, %stride, 5; // 4 bytes * stride * 8 rows
+    }
+
+    .reg .u32 %remainingIters;
+    mov.u32 %remainingIters, %numBlocks;
+
+outer_loop:
+    setp.gt.u32 %p0, %remainingIters, 0;
+    @!%p0 bra outer_loop_end;
+    {
+        .reg .u32 %i;
+        mov.u32 %i, 0;
+    inner_loop:
+        .reg .b32 %a<4>;
+        .reg .b32 %b<4>;
+        wmma.load.a.sync.aligned.row.m16n16k8.global.tf32 {%a0, %a1, %a2, %a3}, [%pointerInA], %stride32;
+        wmma.load.b.sync.aligned.row.m16n16k8.global.tf32 {%b0, %b1, %b2, %b3}, [%pointerInB], %stride32;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+        add.u64 %pointerInA, %pointerInA, 32; // 8 floats * 4 bytes
+        add.u64 %pointerInB, %pointerInB, %strideB;
+        add.u32 %i, %i, 1;
+        setp.eq.u32 %p0, %i, 4;
+        @!%p0 bra inner_loop;
+    inner_loop_end:
+    }
+
+    sub.u32 %remainingIters, %remainingIters, 1;
+outer_loop_end:
+
+    {
+        .reg .u64 %outColumn;
+        .reg .u64 %outOffset;
+        .reg .u64 %tmp;
+
+        shl.b64 %outColumn, %ctaX, 7; // 32 floats * 4 bytes
+        cvt.u64.u32 %tmp, %tidY;
+        and.b64 %tmp, %tmp, 1; // 1 if second column of block, 0 if first
+        shl.b64 %tmp, %tmp, 6; // 16 floats * 4 bytes
+        add.u64 %outColumn, %outColumn, %tmp;
+
+        shl.b64 %outOffset, %stride, 7; // turn into a row offset (4 bytes), times 32 rows
+        mul.lo.u64 %outOffset, %outOffset, %ctaY;
+        add.u64 %outOffset, %outOffset, %outColumn;
+        add.u64 %ptrOut, %ptrOut, %outOffset;
+
+        // Copy to %ptrOut.
+        wmma.store.d.sync.aligned.m16n16k16.global.row.f32 [%ptrOut], {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+    }
+
+    ret;
+}
