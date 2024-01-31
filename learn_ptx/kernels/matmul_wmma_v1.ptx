@@ -96,6 +96,8 @@
 outer_loop:
     setp.gt.u32 %p0, %remainingIters, 0;
     @!%p0 bra outer_loop_end;
+    sub.u32 %remainingIters, %remainingIters, 1;
+
     {
         .reg .u32 %i;
         mov.u32 %i, 0;
@@ -113,7 +115,7 @@ outer_loop:
     inner_loop_end:
     }
 
-    sub.u32 %remainingIters, %remainingIters, 1;
+    bra outer_loop;
 outer_loop_end:
 
     {
@@ -129,11 +131,19 @@ outer_loop_end:
 
         shl.b64 %outOffset, %stride, 7; // turn into a row offset (4 bytes), times 32 rows
         mul.lo.u64 %outOffset, %outOffset, %ctaY;
+        cvt.u64.u32 %tmp, %tidY;
+
+        // Offset for bottom half.
+        and.b64 %tmp, %tmp, 2; // 2 if second row of block, 0 if first
+        mul.lo.u64 %tmp, %tmp, %stride;
+        shl.b64 %tmp, %tmp, 5; // for second row: 16 * stride * 4 bytes (already was 2, not 1)
+        add.u64 %outOffset, %outOffset, %tmp;
+
         add.u64 %outOffset, %outOffset, %outColumn;
         add.u64 %ptrOut, %ptrOut, %outOffset;
 
         // Copy to %ptrOut.
-        wmma.store.d.sync.aligned.m16n16k16.global.row.f32 [%ptrOut], {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+        wmma.store.d.sync.aligned.m16n16k16.global.row.f32 [%ptrOut], {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, %stride32;
     }
 
     ret;
