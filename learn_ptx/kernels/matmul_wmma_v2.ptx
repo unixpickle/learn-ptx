@@ -73,13 +73,14 @@
         .reg .u32 %stmp;
 
         shl.b64 %tmp, %stride, 7; // 4 bytes per float * 32 rows
-        mul.lo.u64 %tmp, %tmp, %ctaX;
+        mul.lo.u64 %tmp, %tmp, %ctaY;
         add.u64 %pointerInA, %ptrA, %tmp;
         cvt.u64.u32 %tmp, %tidX;
         shl.b64 %tmp, %tmp, 2; // tidX * (4 bytes)
         add.u64 %pointerInA, %pointerInA, %tmp;
         cvt.u64.u32 %tmp, %tidY;
-        shl.b64 %tmp, %tmp, 7; // tidY * 32*(4 bytes)
+        mul.lo.u64 %tmp, %tmp, %stride;
+        shl.b64 %tmp, %tmp, 2; // multiply tidY * stride by 4 bytes per row.
         add.u64 %pointerInA, %pointerInA, %tmp;
 
         mov.u32 %loadPointerInSharedA, sharedA;
@@ -104,7 +105,7 @@
         .reg .u32 %stmp;
         .reg .u64 %tmp<2>;
 
-        shl.b64 %tmp0, %ctaY, 7; // 4 bytes per float * 32 columns
+        shl.b64 %tmp0, %ctaX, 7; // 4 bytes per float * 32 columns
         add.u64 %pointerInB, %ptrB, %tmp0;
         cvt.u64.u32 %tmp1, %tidX;
         shl.b64 %tmp0, %tmp1, 2; // 4 bytes per float
@@ -122,7 +123,7 @@
 
         // pointerInSharedB depends only on which output column we are doing.
         mov.u32 %pointerInSharedB, sharedB;
-        and.b32 %stmp, %stmp, 1; // 1 if second column of block, 0 if first
+        and.b32 %stmp, %tidY, 1; // 1 if second column of block, 0 if first
         shl.b32 %stmp, %stmp, 6; // 16 floats * 4 bytes
         add.u32 %pointerInSharedB, %pointerInSharedB, %stmp;
     }
@@ -212,9 +213,7 @@ outer_loop:
         ld.global.f32 %ftmp, [%tmp];
         st.shared.f32 [%loadPointerInSharedB+3584], %ftmp;
 
-        // We are already at the next spot. This could be easily optimized by
-        // removing %tmp in the future.
-        mov.u64 %pointerInB, %tmp;
+        add.u64 %pointerInB, %tmp, %loadStride;
     }
 
     bar.sync 0;
