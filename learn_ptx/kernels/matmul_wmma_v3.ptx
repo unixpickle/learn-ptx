@@ -101,14 +101,11 @@
         // instructions, such that they can then be rearranged so that the destination
         // matrices are consecutive in shared memory.
         mov.u32 %loadPointerInSharedA, sharedA;
-        shl.b32 %stmp, %tidY, 7; // tidY*(4 rows)*(32 floats)
-        shr.b32 %loadPointerInSharedA, %tidX, 3;
-        shl.b32 %loadPointerInSharedA, %loadPointerInSharedA, 5; // (tidX // 8)*(32 floats)
-        add.u32 %stmp, %stmp, %loadPointerInSharedA;
-        shl.b32 %stmp, %stmp, 2; // (tidY*(4 rows)*(32 floats) + (tidX // 8)*(32 floats))*(4 bytes)
+        shl.b32 %stmp, %tidY, 5; // tidY*(32 floats)
+        add.u32 %stmp, %stmp, %tidX;
+        shl.b32 %stmp, %stmp, 2; // *= 4 bytes
         mov.u32 %loadPointerInSharedA, sharedA;
-        add.u32 %loadPointerInSharedA, %loadPointerInSharedA, %stmp;
-        // add tidX%8
+        add.u32 %loadPointerInSharedA, %loadPointerInSharedA, %stmp; // &sharedA[(tidY*32 + tidX)]
     }
 
     // pointerInB is like pointerInA, except that we advance it by row rather than
