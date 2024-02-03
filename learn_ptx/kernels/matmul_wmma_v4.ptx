@@ -60,10 +60,8 @@
     .reg .u64 %loadAStride;
     .reg .u64 %loadBStride;
     {
-        .reg .u64 %loadStride;
-        shl.b64 %loadStride, %stride, 4; // 4 bytes * 4 rows
-        shl.b64 %loadAStride, %loadStride, 2; // 16 rows at a time
-        shl.b64 %loadBStride, %loadStride, 1; // 8 rows at a time
+        shl.b64 %loadAStride, %stride, 6; // 16 rows at a time
+        shl.b64 %loadBStride, %stride, 5; // 8 rows at a time
     }
 
     // We will use pointerInA to point to a thread-specific part of ptrA,
@@ -206,20 +204,20 @@ outer_loop:
         add.u64 %pointerInB, %pointerInB, %loadBStride;
         ld.global.f32 %ftmp0, [%pointerInB];
         ld.global.f32 %ftmp1, [%pointerInB+64];
-        st.shared.f32 [%loadPointerInSharedB+128], %ftmp0;
-        st.shared.f32 [%loadPointerInSharedB+2176], %ftmp1;
+        st.shared.f32 [%loadPointerInSharedB+512], %ftmp0;
+        st.shared.f32 [%loadPointerInSharedB+2560], %ftmp1;
 
         add.u64 %pointerInB, %pointerInB, %loadBStride;
         ld.global.f32 %ftmp0, [%pointerInB];
         ld.global.f32 %ftmp1, [%pointerInB+64];
-        st.shared.f32 [%loadPointerInSharedB+256], %ftmp0;
-        st.shared.f32 [%loadPointerInSharedB+2304], %ftmp1;
+        st.shared.f32 [%loadPointerInSharedB+1024], %ftmp0;
+        st.shared.f32 [%loadPointerInSharedB+3072], %ftmp1;
 
         add.u64 %pointerInB, %pointerInB, %loadBStride;
         ld.global.f32 %ftmp0, [%pointerInB];
         ld.global.f32 %ftmp1, [%pointerInB+64];
-        st.shared.f32 [%loadPointerInSharedB+384], %ftmp0;
-        st.shared.f32 [%loadPointerInSharedB+2432], %ftmp1;
+        st.shared.f32 [%loadPointerInSharedB+1536], %ftmp0;
+        st.shared.f32 [%loadPointerInSharedB+3584], %ftmp1;
 
         add.u64 %pointerInB, %pointerInB, %loadBStride;
     }
