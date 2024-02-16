@@ -1,0 +1,336 @@
+.version 7.0
+.target sm_80 // needed for wmma instruction
+.address_size 64
+
+// This is like matmul_wmma_v4.ptx, but loads 64x64 blocks instead of 32x32.
+
+.visible .entry wmmaMatmulV4 (
+    .param .u64 ptrA,
+    .param .u64 ptrB,
+    .param .u64 ptrOut,
+    .param .u32 numBlocks
+) {
+    .reg .pred %p0;
+
+    // Attributes of the thread/CTA.
+    .reg .u32 %tidX;
+    .reg .u32 %tidY;
+    .reg .u64 %ctaX;
+    .reg .u64 %ctaY;
+
+    // Arguments
+    .reg .u64 %ptrA;
+    .reg .u64 %ptrB;
+    .reg .u64 %ptrOut;
+    .reg .u32 %numBlocks;
+
+    // Cache for block operands.
+    .shared .align 4 .f32 sharedA[4096];
+    .shared .align 4 .f32 sharedB[4096];
+
+    ld.param.u64 %ptrA, [ptrA];
+    ld.param.u64 %ptrB, [ptrB];
+    ld.param.u64 %ptrOut, [ptrOut];
+    ld.param.u32 %numBlocks, [numBlocks];
+
+    mov.u32 %tidX, %tid.x; // index in warp (0-32)
+    mov.u32 %tidY, %tid.y; // warp index in block (0-16)
+    cvt.u64.u32 %ctaX, %ctaid.x; // column of output
+    cvt.u64.u32 %ctaY, %ctaid.y; // row of output
+
+    // Accumulation registers are stored as 8 floats per thread.
+    .reg .f32 %out<8>;
+    mov.f32 %out0, 0.0;
+    mov.f32 %out1, 0.0;
+    mov.f32 %out2, 0.0;
+    mov.f32 %out3, 0.0;
+    mov.f32 %out4, 0.0;
+    mov.f32 %out5, 0.0;
+    mov.f32 %out6, 0.0;
+    mov.f32 %out7, 0.0;
+
+    // The row-wise stride of the matrices, measured in tf32's.
+    .reg .u64 %stride;
+    {
+        .reg .u64 %tmp;
+        cvt.u64.u32 %tmp, %numBlocks;
+        shl.b32 %stride, %tmp, 6;
+    }
+
+    .reg .u64 %loadAStride;
+    .reg .u64 %loadBStride;
+    {
+        shl.b64 %loadAStride, %stride, 5; // 8 rows at a time
+        shl.b64 %loadBStride, %stride, 7; // 32 rows at a time
+    }
+
+    // We will use pointerInA to point to a thread-specific part of ptrA,
+    // which we increment as we load blocks.
+    // We set loadPointerInSharedA to a pointer where we copy things into
+    // when loading shared memory.
+    // The other argument, %pointerInSharedA, never changes.
+    .reg .u64 %pointerInA;
+    .reg .u32 %loadPointerInSharedA;
+    .reg .u32 %pointerInSharedA;
+    {
+        .reg .u64 %tmp<2>;
+
+        // Each warp will load 4 rows of a 16x8 chunk of A at once.
+        // The first 8 threads load the top row, then the next 8 threads
+        // load the second row, etc.
+        // There are 16 warps in total, so we will load an entire 8x64 chunk
+        // at a time across the block. We have tidY%8 determine the column and
+        // tidY//8 determine the row of the outer block.
+        shl.b64 %tmp0, %stride, 8; // 4 bytes per float * 64 rows
+        mul.lo.u64 %tmp0, %tmp0, %ctaY; // ctaY*(64 rows)*(4 bytes)
+        add.u64 %pointerInA, %ptrA, %tmp0; // pointerInA = &ptrA[ctaY*(64 rows)]
+        cvt.u64.u32 %tmp0, %tidX;
+        mov.u64 %tmp1, %tmp0;
+        and.b64 %tmp0, %tmp0, 7; // tidX % 8 gives our X offset
+        shl.b64 %tmp0, %tmp0, 2; // (tidX % 8) * (4 bytes)
+        add.u64 %pointerInA, %pointerInA, %tmp0; // pointerInA = (tidX % 8) * (4 bytes)
+        shr.b64 %tmp0, %tmp1, 3; // tidX // 8
+        shl.b64 %tmp1, %tmp0, 8; // tmp1 = (tidX // 8)
+        cvt.u64.u32 %tmp0, %tidY;
+        {
+            .reg .u64 %tmp;
+            and.b64 %tmp, %tmp0, 7; // tidY % 8
+            shl.b64 %tmp, %tmp, 5; // (tidY % 8) * (8 floats) * (4 bytes)
+            add.u64 %pointerInA, %pointerInA, %tmp; // pointerInA += (tidY % 8) * 32
+        }
+        shr.b64 %tmp0, %tmp0, 3; // tidY // 8
+        shl.b64 %tmp0, %tmp0, 2; // (tidY // 8) * (4 rows)
+        add.u64 %tmp0, %tmp0, %tmp1; // (tidY // 8) * (4 rows) + (tidX // 8)
+        mul.lo.u64 %tmp0, %tmp0, %stride;
+        shl.b64 %tmp0, %tmp0, 2; // multiply ((tidY // 8) * (4 rows) + (tidX // 8)) * stride by 4 bytes per row
+        add.u64 %pointerInA, %pointerInA, %tmp0;
+
+        // The block we are working on is indexed by
+        //     (tidY % 8)
+        // and the specific row in the block is given by:
+        //     (tidX // 8) + (tidY // 8)*4
+        // which means the index within the block is given by
+        //     ((tidX // 8) + (tidY // 8)*4)*8 + tidX%8
+        //     = tidX + (tidY & 24)*4
+        {
+            .reg .u32 %stmp;
+            mov.u32 %loadPointerInSharedA, sharedA;
+
+            // Offset based on block.
+            and.b32 %stmp, %tidY, 7;
+            shl.b32 %stmp, %stmp, 9; // (16*8 floats)*(4 bytes)
+            add.u32 %loadPointerInSharedA, %loadPointerInSharedA, %stmp; // Add (tidY % 8)*(16*8 floats)*(4 bytes)
+
+            // Small offset based on row.
+            and.b32 %stmp, %tidY, 24;
+            shl.b32 %stmp, %stmp, 2;
+            add.u32 %stmp, %stmp, %tidX;
+            shl.b32 %stmp, %stmp, 2; // *= 4 bytes
+            add.u32 %loadPointerInSharedA, %loadPointerInSharedA, %stmp; // Add (tidX + (tidY & 24)*4)*(4 bytes)
+        }
+
+        // We only care about the 4 row-wise splits of A, which we determine by the higher
+        // two bits of tidY.
+        and.b32 %stmp, %tidY, 12;
+        shl.b32 %stmp, %stmp, 10; // (16*8 floats)*(8 matrices)*(4 bytes) / (4 from tidY and)
+        mov.u32 %pointerInSharedA, sharedA;
+        add.u32 %pointerInSharedA, %pointerInSharedA, %stmp;
+    }
+
+    // Each warp will load two rows at a time, one column at a time, in four
+    // sequential reads. There are 16 warps total, so we will load all 64 rows
+    // in two stages.
+    .reg .u64 %pointerInB;
+    .reg .u32 %loadPointerInSharedB;
+    .reg .u32 %pointerInSharedB;
+    {
+        .reg .u32 %stmp;
+        .reg .u64 %tmp<2>;
+
+        shl.b64 %tmp0, %ctaX, 8; // 4 bytes per float * 64 columns
+        add.u64 %pointerInB, %ptrB, %tmp0;
+
+        cvt.u64.u32 %tmp0, %tidX;
+        shr.b64 %tmp0, %tmp0, 4;
+        cvt.u64.u32 %tmp1, %tidY;
+        shl.b64 %tmp1, %tmp1, 1; // tidY*2
+        add.u64 %tmp0, %tmp0, %tmp1;
+        shl.b64 %tmp0, %tmp0, 2; // multiply by 4 to turn stride into bytes
+        mul.lo.u64 %tmp0, %tmp0, %stride;
+        add.u64 %pointerInB, %pointerInB, %tmp0; // pointerInB += stride * (4 bytes) * ((tidX//16) + tidY*2)
+
+        cvt.u64.u32 %tmp0, %tidX;
+        and.b64 %tmp0, %tmp0, 15;
+        shl.b64 %tmp0, %tmp0, 2; // 4 * (tidX % 16)
+        add.u64 %pointerInB, %pointerInB, %tmp0; // pointerInB += (4 bytes) * (tidX % 16)
+
+        // Offset of store is given by (4 bytes) * (tidX + tidY*32)
+        mov.u32 %loadPointerInSharedB, sharedB;
+        shl.b32 %stmp, %tidX, 2; // tidX*4 bytes
+        add.u32 %loadPointerInSharedB, %loadPointerInSharedB, %stmp;
+        shl.b32 %stmp, %tidY, 7; // tidY * 32 * (4 bytes)
+        add.u32 %loadPointerInSharedB, %loadPointerInSharedB, %stmp;
+
+        // pointerInSharedB depends on which output column we are doing, which is
+        // indicated using the first two bits of tidY.
+        mov.u32 %pointerInSharedB, sharedB;
+        and.b32 %stmp, %tidY, 3;
+        shl.b32 %stmp, %stmp, 12; // 8 matrices * (16 * 8) * 4 bytes
+        add.u32 %pointerInSharedB, %pointerInSharedB, %stmp;
+    }
+
+    .reg .u32 %remainingIters;
+    mov.u32 %remainingIters, %numBlocks;
+
+outer_loop:
+    setp.gt.u32 %p0, %remainingIters, 0;
+    @!%p0 bra outer_loop_end;
+    sub.u32 %remainingIters, %remainingIters, 1;
+
+    // Load matrix A into shared memory.
+    {
+        .reg .f32 %ftmp<4>;
+        .reg .u64 %tmp<4>;
+
+        add.u64 %tmp0, %loadPointerInSharedA, %loadAStride;
+        add.u64 %tmp1, %tmp0, %loadAStride;
+        add.u64 %tmp2, %tmp1, %loadAStride;
+
+        // Load the first two 16x64 chunks by loading 8 rows at a time.
+        ld.global.f32 %ftmp0, [%pointerInA];
+        ld.global.f32 %ftmp1, [%tmp0];
+        ld.global.f32 %ftmp2, [%tmp1];
+        ld.global.f32 %ftmp3, [%tmp2];
+
+        st.shared.f32 [%loadPointerInSharedA], %ftmp0;
+        // Add size of eight rows each time: 8*8*(4 bytes)
+        st.shared.f32 [%loadPointerInSharedA+256], %ftmp1;
+        // Now we are working on the next 8 matrices, so we add 8*(8*16 floats)*(4 bytes)
+        st.shared.f32 [%loadPointerInSharedA+4096], %ftmp2;
+        st.shared.f32 [%loadPointerInSharedA+4352], %ftmp3;
+
+        // Do the same thing for the bottom two 16x32 chunks of A.
+        add.u64 %tmp0, %tmp2, %loadAStride;
+        add.u64 %tmp1, %tmp0, %loadAStride;
+        add.u64 %tmp2, %tmp1, %loadAStride;
+        add.u64 %tmp3, %tmp2, %loadAStride;
+
+        // Load the last two 16x64 chunks by loading 8 rows at a time.
+        ld.global.f32 %ftmp0, [%tmp0];
+        ld.global.f32 %ftmp1, [%tmp1];
+        ld.global.f32 %ftmp2, [%tmp2];
+        ld.global.f32 %ftmp3, [%tmp3];
+
+        // Now we are working past the 16th matrix, so we add 16*(8*16 floats)*(4 bytes)
+        st.shared.f32 [%loadPointerInSharedA+8192], %ftmp0;
+        // Add size of eight rows each time: 8*8*(4 bytes)
+        st.shared.f32 [%loadPointerInSharedA+8448], %ftmp1;
+        // Now we are working on the next 8 matrices, so we add 24*(8*16 floats)*(4 bytes)
+        st.shared.f32 [%loadPointerInSharedA+12288], %ftmp2;
+        st.shared.f32 [%loadPointerInSharedA+12544], %ftmp3;
+
+        // Advance to the right 64 floats (columns).
+        add.u64 %pointerInA, %pointerInA, 256;
+    }
+
+    // Load matrix B into shared memory.
+    {
+        .reg .f32 %ftmp<4>;
+
+        ld.global.f32 %ftmp0, [%pointerInB];
+        ld.global.f32 %ftmp1, [%pointerInB+64]; // offset by 16 columns
+        ld.global.f32 %ftmp2, [%pointerInB+128]; // offset by 16 columns
+        ld.global.f32 %ftmp3, [%pointerInB+192]; // offset by 16 columns
+        st.shared.f32 [%loadPointerInSharedB], %ftmp0;
+        st.shared.f32 [%loadPointerInSharedB+4096], %ftmp1; // (8 matrices) * (16 * 8) * (4 bytes)
+        st.shared.f32 [%loadPointerInSharedB+8192], %ftmp2; // (16 matrices) * (16 * 8) * (4 bytes)
+        st.shared.f32 [%loadPointerInSharedB+12288], %ftmp3; // (24 matrices) * (16 * 8) * (4 bytes)
+
+        // Repeat while going down rows in B.
+        add.u64 %pointerInB, %pointerInB, %loadBStride;
+
+        ld.global.f32 %ftmp0, [%pointerInB];
+        ld.global.f32 %ftmp1, [%pointerInB+64]; // offset by 16 columns
+        ld.global.f32 %ftmp2, [%pointerInB+128]; // offset by 16 columns
+        ld.global.f32 %ftmp3, [%pointerInB+192]; // offset by 16 columns
+        st.shared.f32 [%loadPointerInSharedB+2048], %ftmp0;
+        st.shared.f32 [%loadPointerInSharedB+6144], %ftmp1; // 2048 + (8 matrices) * (16 * 8) * (4 bytes)
+        st.shared.f32 [%loadPointerInSharedB+10240], %ftmp2; // 2048 + (16 matrices) * (16 * 8) * (4 bytes)
+        st.shared.f32 [%loadPointerInSharedB+14336], %ftmp3; // 2048 + (24 matrices) * (16 * 8) * (4 bytes)
+
+        add.u64 %pointerInB, %pointerInB, %loadBStride;
+    }
+
+    bar.sync 0;
+
+    {
+        .reg .b32 %a<4>;
+        .reg .b32 %b<4>;
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA+512], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB+512], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA+1024], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB+1024], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA+1536], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB+1536], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA+2048], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB+2048], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA+2560], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB+2560], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA+3072], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB+3072], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a0, %a1, %a2, %a3}, [%pointerInSharedA+3584], 8;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%pointerInSharedB+3584], 16;
+        wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7};
+    }
+
+    bar.sync 0;
+
+    bra outer_loop;
+outer_loop_end:
+
+    {
+        .reg .u64 %outColumn;
+        .reg .u64 %outOffset;
+        .reg .u64 %tmp;
+
+        shl.b64 %outColumn, %ctaX, 8; // 64 floats * 4 bytes
+        cvt.u64.u32 %tmp, %tidY;
+        and.b64 %tmp, %tmp, 3; // Offset for output column
+        shl.b64 %tmp, %tmp, 6; // 16 floats * 4 bytes
+        add.u64 %outColumn, %outColumn, %tmp;
+
+        shl.b64 %outOffset, %stride, 8; // turn into a row offset (4 bytes), times 64 rows
+        mul.lo.u64 %outOffset, %outOffset, %ctaY;
+
+        // Offset for row
+        cvt.u64.u32 %tmp, %tidY;
+        and.b64 %tmp, %tmp, 12; // Row offset times 4
+        mul.lo.u64 %tmp, %tmp, %stride;
+        shl.b64 %tmp, %tmp, 4; // for second row: 16 * stride * 4 bytes / (4 for the offset of tidY row)
+        add.u64 %outOffset, %outOffset, %tmp;
+
+        add.u64 %outOffset, %outOffset, %outColumn;
+        add.u64 %ptrOut, %ptrOut, %outOffset;
+
+        // Copy to %ptrOut.
+        wmma.store.d.sync.aligned.m16n16k16.global.row.f32 [%ptrOut], {%out0, %out1, %out2, %out3, %out4, %out5, %out6, %out7}, %stride32;
+    }
+
+    ret;
+}
