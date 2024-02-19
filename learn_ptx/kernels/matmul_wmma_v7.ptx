@@ -85,10 +85,12 @@
         cvt.u64.u32 %tmp0, %tidY;
         shr.b64 %tmp1, %tmp0, 2; // tidY // 4
         and.b64 %tmp0, %tmp0, 3; // tidY % 4
+        shl.b64 %pointerInA, %ctaY, 2; // 4 16x16 blocks per outer row
+        add.u64 %tmp1, %tmp1, %pointerInA;
         mul.lo.u64 %pointerInA, %tmp1, %stride;
         add.u64 %pointerInA, %tmp0, %pointerInA;
         shl.b64 %pointerInA, %pointerInA, 6; // *= (16 floats) * (4 bytes/float)
-        add.u64 %pointerInA, %pointerInA, %ptrA; // &ptrA[16*((tidY % 4) + stride*(tidY // 4))]
+        add.u64 %pointerInA, %pointerInA, %ptrA; // &ptrA[16*((tidY % 4) + stride*(tidY // 4 + 4*ctaY))]
 
         // We load from a row of A, given by tidY // 4.
         shr.b32 %stmp0, %tidY, 2; // tidY // 4
@@ -144,7 +146,7 @@
         // The second column will be offset by (64 * 16 floats * (4 bytes/float)) = 4096 bytes.
         // Hence why column is multiplied by 16 instead of 8, when there are only 8 rows.
         and.b32 %stmp0, %tidY, 1; // column
-        shr.b32 %stmp1, %tidY, 2; // row
+        shr.b32 %stmp1, %tidY, 1; // row
         shl.b32 %stmp0, %stmp0, 4; // column * 16
         add.u32 %stmp0, %stmp0, %stmp1; // stmp0 = column*8 + row
         shl.b32 %stmp0, %stmp0, 9; // *= (16*8 floats) * (4 bytes/float)
