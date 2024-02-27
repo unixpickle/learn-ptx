@@ -2,14 +2,12 @@
 .target sm_80 // needed for wmma instruction
 .address_size 64
 
-// Like matmul_wmma_v8.ptx, but uses 4 warps instead of 16 and pre-fetches the
-// relevant row from A into registers to use on all 4 columns.
-// Likewise, it accumulates an entire row of results instead of just a single 16x16
-// block.
-// This reduces the reliance on shared memory reads for A, which seem to be a source
-// of overhead when using really fast TensorCores.
+// Like matmul_wmma_v9.ptx, but uses vectorized loads from each thread
+// to load all 64 columns at once. This requires slightly different padding.
+// In particular, we now add one padding float between the first 32 columns
+// and the second 32 columns, to prevent bank conflicts.
 
-.visible .entry wmmaMatmulV9 (
+.visible .entry wmmaMatmulV10 (
     .param .u64 ptrA,
     .param .u64 ptrB,
     .param .u64 ptrOut,
@@ -96,8 +94,7 @@
     shl.b64 %loadBStride, %stride, 8; // 64 rows * (4 bytes/float)
 
     // We want to load 64 rows with 4 warps.
-    // Each warp will load 16 consecutive rows, one 32-float column
-    // at a time.
+    // Each warp will load 16 consecutive rows, one column at a time.
     // The pointerInA will point to the thread-specific location in the first
     // row and first column to load.
     // We will store the data in sharedA, and the first location is pointed to
@@ -118,9 +115,10 @@
         add.u64 %tmp0, %tmp0, %tmp1;
         mul.lo.u64 %tmp1, %tmp0, %stride; // floats / row
         cvt.u64.u32 %tmp0, %tidX;
+        shl.b64 %tmp0, %tmp0, 1; // tidX * 2 since we load two values at once.
         add.u64 %tmp1, %tmp1, %tmp0;
         shl.b64 %tmp1, %tmp1, 2; // 4 bytes / float
-        add.u64 %pointerInA, %tmp1, %ptrA; // &ptrA[4*stride*(tidY*4 + ctaY*64 + tidX)]
+        add.u64 %pointerInA, %tmp1, %ptrA; // &ptrA[4*stride*(tidY*4 + ctaY*64 + tidX*2)]
 
         // We load from a row of A, given by tidY.
         mul.lo.u32 %stmp0, %tidY, 4608; // *= (16 rows) * (64+8 floats/row) * (4 bytes/float)
@@ -128,10 +126,16 @@
         add.u32 %loadPointerInSharedA, %loadPointerInSharedA, %stmp0;
 
         // We will store our row into sharedA similar to how we loaded it.
-        // The offset will be ((tidY*16 rows) * (64 + 8 floats/row) + tidX) * (4 bytes/float)
+        // The offset will be ((tidY*16 rows) * (64 + 8 floats/row) + tidX*2 + int(tidX > 15)) * (4 bytes/float)
         shl.b32 %stmp0, %tidY, 4; // tidY * 16
         mul.lo.u32 %stmp0, %stmp0, 72; // (64+8)
         add.u32 %stmp0, %stmp0, %tidX;
+        add.u32 %stmp0, %stmp0, %tidX;
+
+        // Offset for mid-column padding.
+        setp.gt.u32 %p0, %tidX, 15;
+        @%p0 add.u32 %stmp0, %stmp0, 1;
+
         shl.b32 %stmp0, %stmp0, 2; // *= 4 bytes/float
         mov.u32 %storePointerInSharedA, sharedA;
         add.u32 %storePointerInSharedA, %storePointerInSharedA, %stmp0;
@@ -153,15 +157,22 @@
         shl.b64 %tmp0, %tmp0, 4; // tidY * 16 rows
         mul.lo.u64 %tmp1, %tmp0, %stride; // floats / row
         cvt.u64.u32 %tmp0, %tidX;
+        shl.b64 %tmp0, %tmp0, 1; // tidX * 2 since we load two values at once.
         add.u64 %tmp1, %tmp1, %tmp0;
         shl.b64 %tmp1, %tmp1, 2; // 4 bytes / float
-        add.u64 %pointerInB, %pointerInB, %tmp1; // &ptrB[ctaX*64 + stride*4*(tidY*4) + tidX*4]
+        add.u64 %pointerInB, %pointerInB, %tmp1; // &ptrB[ctaX*64 + stride*(tidY*4) + tidX*2]
 
         // We will store our row into sharedB similar to how we loaded it.
-        // The offset will be ((tidY*16 rows) * (64 + 16 floats/row) + tidX) * (4 bytes/float)
+        // The offset will be ((tidY*16 rows) * (64 + 16 floats/row) + tidX*2 + int(tidX > 15)) * (4 bytes/float)
         shl.b32 %stmp0, %tidY, 4; // tidY * 16
         mul.lo.u32 %stmp0, %stmp0, 80; // (64+16)
         add.u32 %stmp0, %stmp0, %tidX;
+        add.u32 %stmp0, %stmp0, %tidX;
+
+        // Offset for mid-column padding.
+        setp.gt.u32 %p0, %tidX, 15;
+        @%p0 add.u32 %stmp0, %stmp0, 1;
+
         shl.b32 %stmp0, %stmp0, 2; // *= 4 bytes/float
         mov.u32 %storePointerInSharedB, sharedB;
         add.u32 %storePointerInSharedB, %storePointerInSharedB, %stmp0;
@@ -196,25 +207,21 @@ outer_loop:
             add.u64 %tmp2, %tmp1, %bytesPerRow;
             add.u64 %tmp3, %tmp2, %bytesPerRow;
 
-            // Load four rows, two columns at a time.
-            ld.global.f32 %ftmp0, [%tmp0];
-            ld.global.f32 %ftmp1, [%tmp0+128];
-            ld.global.f32 %ftmp2, [%tmp1];
-            ld.global.f32 %ftmp3, [%tmp1+128];
-            ld.global.f32 %ftmp4, [%tmp2];
-            ld.global.f32 %ftmp5, [%tmp2+128];
-            ld.global.f32 %ftmp6, [%tmp3];
-            ld.global.f32 %ftmp7, [%tmp3+128];
+            // Load four rows, with two consecutive values at a time.
+            ld.global.v2.f32 {%ftmp0, %ftmp1}, [%tmp0];
+            ld.global.v2.f32 {%ftmp2, %ftmp3}, [%tmp1];
+            ld.global.v2.f32 {%ftmp4, %ftmp5}, [%tmp2];
+            ld.global.v2.f32 {%ftmp6, %ftmp7}, [%tmp3];
     
-            // Every other value, we offset (32+8)*4 rather than 32*4.
+            // Every other value, we offset (64+8)*4 rather than 4.
             st.shared.b32 [%storePtr], %ftmp0;
-            st.shared.b32 [%storePtr+128], %ftmp1;
+            st.shared.b32 [%storePtr+4], %ftmp1;
             st.shared.b32 [%storePtr+288], %ftmp2;
-            st.shared.b32 [%storePtr+288+128], %ftmp3;
+            st.shared.b32 [%storePtr+288+4], %ftmp3;
             st.shared.b32 [%storePtr+288*2], %ftmp4;
-            st.shared.b32 [%storePtr+288*2+128], %ftmp5;
+            st.shared.b32 [%storePtr+288*2+4], %ftmp5;
             st.shared.b32 [%storePtr+288*3], %ftmp6;
-            st.shared.b32 [%storePtr+288*3+128], %ftmp7;
+            st.shared.b32 [%storePtr+288*3+4], %ftmp7;
 
             add.u32 %storePtr, %storePtr, 1152; // add 288*4
             add.u64 %tmp0, %tmp3, %bytesPerRow;
@@ -247,25 +254,21 @@ outer_loop:
             add.u64 %tmp2, %tmp1, %bytesPerRow;
             add.u64 %tmp3, %tmp2, %bytesPerRow;
 
-            // Load four rows, two columns at a time.
-            ld.global.f32 %ftmp0, [%tmp0];
-            ld.global.f32 %ftmp1, [%tmp0+128];
-            ld.global.f32 %ftmp2, [%tmp1];
-            ld.global.f32 %ftmp3, [%tmp1+128];
-            ld.global.f32 %ftmp4, [%tmp2];
-            ld.global.f32 %ftmp5, [%tmp2+128];
-            ld.global.f32 %ftmp6, [%tmp3];
-            ld.global.f32 %ftmp7, [%tmp3+128];
+            // Load four rows, with two consecutive values at a time.
+            ld.global.v2.f32 {%ftmp0, %ftmp1}, [%tmp0];
+            ld.global.v2.f32 {%ftmp2, %ftmp3}, [%tmp1];
+            ld.global.v2.f32 {%ftmp4, %ftmp5}, [%tmp2];
+            ld.global.v2.f32 {%ftmp6, %ftmp7}, [%tmp3];
     
-            // Every other value, we offset (32+16)*4 rather than 32*4.
+            // Every other value, we offset (64+16)*4 rather than 4.
             st.shared.b32 [%storePtr], %ftmp0;
-            st.shared.b32 [%storePtr+128], %ftmp1;
+            st.shared.b32 [%storePtr+4], %ftmp1;
             st.shared.b32 [%storePtr+320], %ftmp2;
-            st.shared.b32 [%storePtr+320+128], %ftmp3;
+            st.shared.b32 [%storePtr+320+4], %ftmp3;
             st.shared.b32 [%storePtr+320*2], %ftmp4;
-            st.shared.b32 [%storePtr+320*2+128], %ftmp5;
+            st.shared.b32 [%storePtr+320*2+4], %ftmp5;
             st.shared.b32 [%storePtr+320*3], %ftmp6;
-            st.shared.b32 [%storePtr+320*3+128], %ftmp7;
+            st.shared.b32 [%storePtr+320*3+4], %ftmp7;
 
             add.u32 %storePtr, %storePtr, 1280; // add 320*4
             add.u64 %tmp0, %tmp3, %bytesPerRow;
@@ -290,6 +293,8 @@ outer_loop:
         //    for i in range(8):
         //        j = i * 4
         //        offset = i * 32
+        //        if i >= 4:
+        //            offset += 4
         //        print(
         //            f"        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {{%a{j}, %a{j+1}, %a{j+2}, %a{j+3}}}, [%loadPointerInSharedA+{offset}], 72;"
         //        )
@@ -298,16 +303,16 @@ outer_loop:
         wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a4, %a5, %a6, %a7}, [%loadPointerInSharedA+32], 72;
         wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a8, %a9, %a10, %a11}, [%loadPointerInSharedA+64], 72;
         wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a12, %a13, %a14, %a15}, [%loadPointerInSharedA+96], 72;
-        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a16, %a17, %a18, %a19}, [%loadPointerInSharedA+128], 72;
-        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a20, %a21, %a22, %a23}, [%loadPointerInSharedA+160], 72;
-        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a24, %a25, %a26, %a27}, [%loadPointerInSharedA+192], 72;
-        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a28, %a29, %a30, %a31}, [%loadPointerInSharedA+224], 72;
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a16, %a17, %a18, %a19}, [%loadPointerInSharedA+132], 72;
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a20, %a21, %a22, %a23}, [%loadPointerInSharedA+164], 72;
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a24, %a25, %a26, %a27}, [%loadPointerInSharedA+196], 72;
+        wmma.load.a.sync.aligned.row.m16n16k8.shared.tf32 {%a28, %a29, %a30, %a31}, [%loadPointerInSharedA+228], 72;
 
         // Each column of B gets a separate matmul.
         //    for col in range(4):
         //        for row in range(8):
         //            print(
-        //                f"        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {{%b0, %b1, %b2, %b3}}, [%loadPointerInSharedB+{col*64}+2560*{row}], 80;"
+        //                f"        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {{%b0, %b1, %b2, %b3}}, [%loadPointerInSharedB+{col*64 + int(col >= 2)*4}+2560*{row}], 80;"
         //            )
         //            out_start = col * 8
         //            a_start = row * 4
@@ -348,37 +353,37 @@ outer_loop:
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out8, %out9, %out10, %out11, %out12, %out13, %out14, %out15}, {%a24, %a25, %a26, %a27}, {%b0, %b1, %b2, %b3}, {%out8, %out9, %out10, %out11, %out12, %out13, %out14, %out15};
         wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+64+2560*7], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out8, %out9, %out10, %out11, %out12, %out13, %out14, %out15}, {%a28, %a29, %a30, %a31}, {%b0, %b1, %b2, %b3}, {%out8, %out9, %out10, %out11, %out12, %out13, %out14, %out15};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*0], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*0], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*1], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*1], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a4, %a5, %a6, %a7}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*2], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*2], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a8, %a9, %a10, %a11}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*3], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*3], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a12, %a13, %a14, %a15}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*4], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*4], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a16, %a17, %a18, %a19}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*5], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*5], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a20, %a21, %a22, %a23}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*6], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*6], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a24, %a25, %a26, %a27}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+128+2560*7], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+132+2560*7], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23}, {%a28, %a29, %a30, %a31}, {%b0, %b1, %b2, %b3}, {%out16, %out17, %out18, %out19, %out20, %out21, %out22, %out23};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*0], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*0], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a0, %a1, %a2, %a3}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*1], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*1], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a4, %a5, %a6, %a7}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*2], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*2], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a8, %a9, %a10, %a11}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*3], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*3], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a12, %a13, %a14, %a15}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*4], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*4], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a16, %a17, %a18, %a19}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*5], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*5], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a20, %a21, %a22, %a23}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*6], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*6], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a24, %a25, %a26, %a27}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
-        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+192+2560*7], 80;
+        wmma.load.b.sync.aligned.row.m16n16k8.shared.tf32 {%b0, %b1, %b2, %b3}, [%loadPointerInSharedB+196+2560*7], 80;
         wmma.mma.sync.aligned.row.row.m16n16k8.f32.tf32.tf32.f32 {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31}, {%a28, %a29, %a30, %a31}, {%b0, %b1, %b2, %b3}, {%out24, %out25, %out26, %out27, %out28, %out29, %out30, %out31};
     }
 
